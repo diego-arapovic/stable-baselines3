@@ -345,6 +345,7 @@ class RolloutBuffer(BaseBuffer):
         gae_lambda: float = 1,
         gamma: float = 0.99,
         n_envs: int = 1,
+        env_cfg: str = None,
     ):
 
         super().__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
@@ -353,6 +354,12 @@ class RolloutBuffer(BaseBuffer):
         self.observations, self.actions, self.rewards, self.advantages = None, None, None, None
         self.returns, self.episode_starts, self.values, self.log_probs = None, None, None, None
         self.generator_ready = False
+        self.env_cfg = env_cfg
+        if self.env_cfg["main"]["policy"] == "S5":
+            self.swap_and_flatten = lambda arr: arr
+        else:
+            pass
+
         self.reset()
 
     def reset(self) -> None:
@@ -364,6 +371,8 @@ class RolloutBuffer(BaseBuffer):
         self.episode_starts = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.values = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.log_probs = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.hidden_states = np.zeros((self.buffer_size, self.n_envs, self.env_cfg["s5"]["ssm_size"] // 2, self.env_cfg["s5"]["n_layers"]), dtype=np.complex64)
+        self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.advantages = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.generator_ready = False
         super().reset()
@@ -388,7 +397,7 @@ class RolloutBuffer(BaseBuffer):
         :param dones: if the last step was a terminal step (one bool for each env).
         """
         # Convert to numpy
-        last_values = last_values.clone().cpu().numpy().flatten()
+        last_values = self.to_numpy(last_values).flatten()
 
         last_gae_lam = 0
         for step in reversed(range(self.buffer_size)):
@@ -405,6 +414,54 @@ class RolloutBuffer(BaseBuffer):
         # in David Silver Lecture 4: https://www.youtube.com/watch?v=PnHCvfgC_ZA
         self.returns = self.advantages + self.values
 
+    def to_numpy(self, tensor):
+        """
+        On the very first call, this method checks the type,
+        creates an optimized converter, and REPLACES itself.
+        """
+        if hasattr(tensor, "detach"):
+            converter = lambda x: x.detach().cpu().numpy()
+        else:
+            converter = lambda x: np.asarray(x)
+        
+        self.to_numpy = converter
+        
+        return converter(tensor)
+
+    def fast_add(
+        self,
+        obs: np.ndarray,
+        action: np.ndarray,
+        reward: np.ndarray,
+        episode_start: np.ndarray,
+        value: np.ndarray,
+        log_prob: np.ndarray,
+        hidden_state: np.ndarray,  # Pre-processed to (Batch, H, Layers)
+        dones: np.ndarray,
+    ) -> None:
+        """
+        Optimized version: No copies, no reshapes, no checks.
+        Trusts the loop to provide correct data.
+        """
+        # DIRECT ASSIGNMENT (Numpy handles the copy into the buffer slice)
+        self.observations[self.pos] = obs
+        self.actions[self.pos] = action
+        self.rewards[self.pos] = reward
+        self.episode_starts[self.pos] = episode_start
+        
+        # Flattening should be done before passing in, but ravel() is cheap if needed
+        self.values[self.pos] = value.ravel() 
+        self.log_probs[self.pos] = log_prob.ravel()
+        
+        # Hidden state is now a single array, assigned directly
+        if hidden_state is not None:
+            self.hidden_states[self.pos] = hidden_state
+            self.dones[self.pos] = dones
+
+        self.pos += 1
+        if self.pos == self.buffer_size:
+            self.full = True
+    
     def add(
         self,
         obs: np.ndarray,
@@ -413,6 +470,8 @@ class RolloutBuffer(BaseBuffer):
         episode_start: np.ndarray,
         value: th.Tensor,
         log_prob: th.Tensor,
+        hidden_state: Any = None,
+        dones: np.ndarray = None,
     ) -> None:
         """
         :param obs: Observation
@@ -440,8 +499,11 @@ class RolloutBuffer(BaseBuffer):
         self.actions[self.pos] = np.array(action).copy()
         self.rewards[self.pos] = np.array(reward).copy()
         self.episode_starts[self.pos] = np.array(episode_start).copy()
-        self.values[self.pos] = value.clone().cpu().numpy().flatten()
-        self.log_probs[self.pos] = log_prob.clone().cpu().numpy()
+        self.values[self.pos] = self.to_numpy(value).flatten().copy()
+        self.log_probs[self.pos] = self.to_numpy(log_prob).flatten().copy()
+        if not hidden_state is None:
+            self.hidden_states[self.pos] = np.array(hidden_state).transpose(1,2,3,0)[0]
+            self.dones[self.pos] = np.array(dones)[None,:].copy()
         self.pos += 1
         if self.pos == self.buffer_size:
             self.full = True
@@ -454,6 +516,8 @@ class RolloutBuffer(BaseBuffer):
 
             _tensor_names = [
                 "observations",
+                "hidden_states",
+                "dones",
                 "actions",
                 "values",
                 "log_probs",
@@ -475,14 +539,28 @@ class RolloutBuffer(BaseBuffer):
             start_idx += batch_size
 
     def _get_samples(self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None) -> RolloutBufferSamples:
-        data = (
-            self.observations[batch_inds],
-            self.actions[batch_inds],
-            self.values[batch_inds].flatten(),
-            self.log_probs[batch_inds].flatten(),
-            self.advantages[batch_inds].flatten(),
-            self.returns[batch_inds].flatten(),
-        )
+        if self.env_cfg["main"]["policy"] == "S5":
+            data = (
+                self.observations[:],
+                self.hidden_states[:],
+                self.dones[:],
+                self.actions[:],
+                self.values[:],
+                self.log_probs[:],
+                self.advantages[:],
+                self.returns[:],
+            )
+        else: 
+            data = (
+                self.observations[batch_inds],
+                self.hidden_states[:],
+                self.dones[:],
+                self.actions[batch_inds],
+                self.values[batch_inds].flatten(),
+                self.log_probs[batch_inds].flatten(),
+                self.advantages[batch_inds].flatten(),
+                self.returns[batch_inds].flatten(),
+            )
         return RolloutBufferSamples(*tuple(map(self.to_torch, data)))
 
 

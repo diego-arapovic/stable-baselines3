@@ -1,10 +1,19 @@
 """Policies: abstract base class and concrete implementations."""
 
+import jax
+import jax.numpy as jnp
+import flax.linen as fnn
+from stable_baselines3.common import s5
+import optax
+from flax.training.train_state import TrainState
+from flax.linen.initializers import constant, orthogonal
+import distrax
+
 import collections
 import copy
 from abc import ABC, abstractmethod
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
+from typing import Any, Dict, List, Callable, Optional, Tuple, Type, TypeVar, Union, Sequence
 
 import gym
 import numpy as np
@@ -363,6 +372,174 @@ class BasePolicy(BaseModel, ABC):
         """
         low, high = self.action_space.low, self.action_space.high
         return low + (0.5 * (scaled_action + 1.0) * (high - low))
+    
+class PPOJaxPolicy():
+    def __init__(
+        self,
+        observation_space: gym.spaces.Space,
+        action_space: gym.spaces.Space,
+        log_std_init: float = 0.0,
+        activation_fn: Callable[[jnp.ndarray], jnp.ndarray] = fnn.tanh,
+        use_sde: bool = False,
+        env_cfg: Dict = None,
+    ):
+
+        super().__init__()
+        self.observation_space = observation_space._shape[0]
+        self.action_space = action_space._shape[0]
+        self.log_std_init = env_cfg["ppo"]["log_std_init"]
+        self.activation_fn = activation_fn
+        self.n_units = 256
+        self.use_sde = use_sde
+        self.env_cfg = env_cfg
+
+    def build(self, key: jax.Array) -> jax.Array:
+        d_model = self.env_cfg["s5"]["d_model"]
+        ssm_size = self.env_cfg["s5"]["ssm_size"]
+        n_layers = self.env_cfg["s5"]["n_layers"]
+        blocks = self.env_cfg["s5"]["blocks"]
+        block_size = int(ssm_size / blocks)
+
+        Lambda, _, _, V,  _ = s5.make_DPLR_HiPPO(ssm_size)
+        block_size = block_size // 2
+        ssm_size = ssm_size // 2
+        Lambda = Lambda[:block_size]
+        V = V[:, :block_size]
+        Vinv = V.conj().T
+
+        ssm_init_fn = s5.init_S5SSM(H=d_model,
+                                    P=ssm_size,
+                                    Lambda_re_init=Lambda.real,
+                                    Lambda_im_init=Lambda.imag,
+                                    V=V,
+                                    Vinv=Vinv,
+                                    C_init="lecun_normal",
+                                    discretization="zoh",
+                                    dt_min=0.001,
+                                    dt_max=0.1,
+                                    conj_sym=True,
+                                    clip_eigs=False,
+                                    bidirectional=False)
+        
+        self.s5net = ActorCriticS5J(
+                action_dim = 4,
+                config = self.env_cfg,
+                ssm_init_fn=ssm_init_fn,
+                )
+        
+        key, self.key = jax.random.split(key)
+        init_obs = jnp.zeros((1, self.env_cfg["main"]["num_envs"], self.observation_space))
+        init_dones = jnp.zeros((1, self.env_cfg["main"]["num_envs"]))
+        init_hstate = s5.StackedEncoderModel.initialize_carry(self.env_cfg["main"]["num_envs"], ssm_size, n_layers)
+        self.schedule = optax.linear_schedule(init_value=self.env_cfg["ppo"]["learning_rate"]["start"],
+                                                end_value=self.env_cfg["ppo"]["learning_rate"]["end"],
+                                                transition_steps=40000
+                                                )
+        self.tx = optax.chain(optax.clip_by_global_norm(0.5), optax.adam(self.schedule, eps=1e-5))
+        
+        self.train_state = TrainState.create(
+            apply_fn=self.s5net.apply,
+            params=self.s5net.init(self.key, init_obs, init_dones, init_hstate),
+            tx=self.tx,
+            )
+
+        self.s5net.apply = jax.jit(self.s5net.apply)
+
+        self.reset_noise()
+
+        return self.noise_key
+
+    def reset_noise(self, batch_size: int = 1) -> None:
+        """
+        Sample new weights for the exploration matrix, when using gSDE.
+        """
+        self.key, self.noise_key = jax.random.split(self.key, 2)
+
+    def forward(self, obs: np.ndarray, deterministic: bool = False) -> np.ndarray:
+        return self._predict(obs, deterministic=deterministic)
+
+    @staticmethod
+    @jax.jit
+    def select_action(train_state, obervations, dones, hiddens):
+        hidden, dist, _ = train_state.apply_fn(train_state.params, obervations, dones, hiddens)
+        return hidden, jnp.squeeze(dist.mode(), axis=0)
+
+    def _predict(self, observation: np.ndarray, done: np.ndarray, hidden: Any) -> np.ndarray:  # type: ignore[override]
+        return self.select_action(self.train_state, observation, done, hidden)
+        
+    def predict_all(self, observation: np.ndarray, done: np.ndarray, hidden, key: jax.Array) -> np.ndarray:
+        return self._predict_all(self.train_state, observation, done, hidden, key)
+
+    @staticmethod
+    @jax.jit
+    def _predict_all(train_state, obervations, dones, hiddens, key):
+        hidden_state, dist, values = train_state.apply_fn(train_state.params, obervations, dones, hiddens)
+        actions = dist.sample(seed=key)
+        log_probs = dist.log_prob(actions)
+        clipped_actions = jnp.clip(actions, -1.0, 1.0)
+        hidden_stack = jnp.stack(hidden_state).transpose(1, 2, 3, 0)[0]
+        return hidden_stack, hidden_state, jnp.squeeze(actions, axis=0), jnp.squeeze(clipped_actions, axis=0), jnp.squeeze(log_probs, axis=0), jnp.squeeze(values, axis=0)
+    
+
+class ActorCriticS5J(fnn.Module):
+    action_dim: Sequence[int]
+    config: Dict
+    ssm_init_fn: Any
+
+    def setup(self):
+        self.encoder_0 = fnn.Dense(128, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+        self.encoder_1 = fnn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+    
+        self.action_body_0 = fnn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+        self.action_body_1 = fnn.Dense(128, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+        self.action_decoder = fnn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))
+
+        self.value_body_0 = fnn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+        self.value_body_1 = fnn.Dense(128, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+        self.value_decoder = fnn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))
+
+        self.act_fn = fnn.relu
+        self.act_fn_t = fnn.tanh
+
+        self.s5 = s5.StackedEncoderModel(
+            ssm=self.ssm_init_fn,
+            d_model=self.config["s5"]["d_model"],
+            n_layers=self.config["s5"]["n_layers"],
+            activation=self.config["s5"]["activation"],
+            do_norm=self.config["s5"]["do_norm"],
+            prenorm=self.config["s5"]["pre_norm"],
+            do_gtrxl_norm=self.config["s5"]["do_gtrxl_norm"],
+        )
+
+        self.log_std_init = self.config['ppo']['log_std_init']
+        
+        self.log_std = self.param("log_std", constant(self.log_std_init), (self.action_dim,))
+    
+    def __call__(self, obs, dones, hidden):
+        embedding = self.encoder_0(obs)
+        embedding = self.act_fn(embedding)
+        embedding = self.encoder_1(embedding)
+        embedding = self.act_fn(embedding)
+
+        hidden, embedding = self.s5(hidden, embedding, dones)
+
+        actor_mean = self.action_body_0(embedding)
+        actor_mean = self.act_fn(actor_mean)
+        actor_mean = self.action_body_1(actor_mean)
+        actor_mean = self.act_fn(actor_mean)
+        actor_mean = self.action_decoder(actor_mean)
+        actor_mean = self.act_fn_t(actor_mean)
+
+        pi = distrax.MultivariateNormalDiag(loc=actor_mean, scale_diag=jnp.exp(self.log_std))
+
+        critic = self.value_body_0(embedding)
+        critic = self.act_fn(critic)
+        critic = self.value_body_1(critic)
+        critic = self.act_fn(critic)
+        critic = self.value_decoder(critic)
+        critic = jnp.squeeze(critic, axis=-1)
+
+        return hidden, pi, critic
 
 
 class ActorCriticPolicy(BasePolicy):
