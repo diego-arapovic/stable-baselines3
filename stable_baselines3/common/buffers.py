@@ -354,8 +354,8 @@ class RolloutBuffer(BaseBuffer):
         self.observations, self.actions, self.rewards, self.advantages = None, None, None, None
         self.returns, self.episode_starts, self.values, self.log_probs = None, None, None, None
         self.generator_ready = False
-        self.env_cfg = env_cfg
-        if self.env_cfg["main"]["policy"] == "S5":
+        if env_cfg is not None and env_cfg["main"].get("policy") == "S5":
+            self.env_cfg = env_cfg
             self.swap_and_flatten = lambda arr: arr
         else:
             pass
@@ -371,8 +371,9 @@ class RolloutBuffer(BaseBuffer):
         self.episode_starts = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.values = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.log_probs = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
-        self.hidden_states = np.zeros((self.buffer_size, self.n_envs, self.env_cfg["s5"]["ssm_size"] // 2, self.env_cfg["s5"]["n_layers"]), dtype=np.complex64)
-        self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        if hasattr(self, "env_cfg") and self.env_cfg is not None:
+            self.hidden_states = np.zeros((self.buffer_size, self.n_envs, self.env_cfg["s5"]["ssm_size"] // 2, self.env_cfg["s5"]["n_layers"]), dtype=np.complex64)
+            self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.advantages = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.generator_ready = False
         super().reset()
@@ -501,7 +502,7 @@ class RolloutBuffer(BaseBuffer):
         self.episode_starts[self.pos] = np.array(episode_start).copy()
         self.values[self.pos] = self.to_numpy(value).flatten().copy()
         self.log_probs[self.pos] = self.to_numpy(log_prob).flatten().copy()
-        if not hidden_state is None:
+        if hidden_state is not None:
             self.hidden_states[self.pos] = np.array(hidden_state).transpose(1,2,3,0)[0]
             self.dones[self.pos] = np.array(dones)[None,:].copy()
         self.pos += 1
