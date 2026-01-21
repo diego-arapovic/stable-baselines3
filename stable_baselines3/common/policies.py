@@ -428,12 +428,12 @@ class PPOJaxPolicy():
                 )
         
         key, self.key = jax.random.split(key)
-        init_obs = jnp.zeros((1, self.env_cfg["main"]["num_envs"], self.observation_space))
+        init_obs = jnp.zeros((1, self.env_cfg["main"]["num_envs"], self.observation_space)) # adapt if necessary, to (self.env_cfg["main"]["num_envs"], self.observation_space)
         init_dones = jnp.zeros((1, self.env_cfg["main"]["num_envs"]))
         init_hstate = s5.StackedEncoderModel.initialize_carry(self.env_cfg["main"]["num_envs"], ssm_size, n_layers)
         self.schedule = optax.linear_schedule(init_value=self.env_cfg["ppo"]["learning_rate"]["start"],
                                                 end_value=self.env_cfg["ppo"]["learning_rate"]["end"],
-                                                transition_steps=40000
+                                                transition_steps=40000 #TODO adapt if necessary, e.g. 16000
                                                 )
         self.tx = optax.chain(optax.clip_by_global_norm(0.5), optax.adam(self.schedule, eps=1e-5))
         
