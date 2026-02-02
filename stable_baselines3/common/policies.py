@@ -20,6 +20,11 @@ import numpy as np
 import torch as th
 from torch import nn
 
+from stable_baselines3.common.conv_ssm import diagonal_ssm as conv_s5_ssm
+from stable_baselines3.common.conv_ssm import layers as conv_s5_layers
+from stable_baselines3.common.conv_ssm import conv_ops
+from stable_baselines3.common.conv_ssm.resnet import ResNetEncoder
+
 from stable_baselines3.common.distributions import (
     BernoulliDistribution,
     CategoricalDistribution,
@@ -540,6 +545,184 @@ class ActorCriticS5J(fnn.Module):
         critic = jnp.squeeze(critic, axis=-1)
 
         return hidden, pi, critic
+    
+
+class PPOJaxConvPolicy(PPOJaxPolicy):
+    """
+    PPO Policy specialized for ConvS5 initialization.
+    """
+    def build(self, key: jax.Array) -> jax.Array:
+        # Extract ConvS5 specific configs
+        c_cfg = self.env_cfg["conv_s5"]
+        
+        ssm_size = c_cfg["ssm_size"]
+        blocks = c_cfg["blocks"]
+        d_model = c_cfg["d_model"] # Number of channels (U)
+        
+        # Initialize ConvS5SSM function
+        # This follows the init_ConvS5SSM signature from src/models/convS5/diagonal_ssm.py
+        ssm_init_fn = conv_s5_ssm.init_ConvS5SSM(
+            ssm_size=ssm_size,
+            blocks=blocks,
+            clip_eigs=c_cfg.get("clip_eigs", False),
+            U=d_model,
+            k_B=c_cfg["B_kernel_size"],
+            k_C=c_cfg["C_kernel_size"],
+            k_D=c_cfg["D_kernel_size"],
+            dt_min=c_cfg.get("dt_min", 0.001),
+            dt_max=c_cfg.get("dt_max", 0.1),
+            C_D_config=c_cfg.get("C_D_config", "resnet")
+        )
+        
+        self.s5net = ActorCriticConvS5(
+            action_dim=4,
+            config=self.env_cfg,
+            ssm_init_fn=ssm_init_fn,
+        )
+        
+        key, self.key = jax.random.split(key)
+        
+        # Initialize Observation (Mocking the shapes)
+        # Image: [B, H, W, C], Privileged: [B, D_priv]
+        bs = self.env_cfg["main"]["num_envs"]
+        img_shape = (bs, 64, 64, 1) # Example shape, adjust to your config
+        priv_shape = (bs, 18)       # Example shape, adjust to your config
+        
+        init_obs = {
+            'image': jnp.zeros(img_shape),
+            'state': jnp.zeros(priv_shape)
+        }
+        init_dones = jnp.zeros((bs,))
+        
+        # Initialize Hidden State
+        # ConvS5 hidden state is a list of tensors: [layers, B, H, W, P]
+        # We manually create the zero init state matching the latent dimensions
+        latent_h = img_shape[1] // (2 ** self.env_cfg["conv_s5"]["encoder_blocks"]) # approx
+        latent_w = img_shape[2] // (2 ** self.env_cfg["conv_s5"]["encoder_blocks"]) # approx
+        
+        # P = ssm_size // 2 (due to complex numbers handling in the repo)
+        P = ssm_size // 2 
+        
+        init_hstate = [
+            jnp.zeros((bs, latent_h, latent_w, P)) 
+            for _ in range(c_cfg["n_layers"])
+        ]
+
+        self.schedule = optax.linear_schedule(
+            init_value=self.env_cfg["ppo"]["learning_rate"]["start"],
+            end_value=self.env_cfg["ppo"]["learning_rate"]["end"],
+            transition_steps=40000
+        )
+        self.tx = optax.chain(optax.clip_by_global_norm(0.5), optax.adam(self.schedule, eps=1e-5))
+        
+        self.train_state = TrainState.create(
+            apply_fn=self.s5net.apply,
+            params=self.s5net.init(self.key, init_obs, init_dones, init_hstate),
+            tx=self.tx,
+        )
+
+        self.s5net.apply = jax.jit(self.s5net.apply)
+        self.reset_noise()
+
+        return self.noise_key
+    
+
+class ActorCriticConvS5(fnn.Module):
+    action_dim: int
+    config: Dict
+    ssm_init_fn: Any
+
+    def setup(self):
+        # 1. Visual Encoder (ResNet)
+        # Config example: depths=[32, 64, 128], blocks=1
+        self.encoder = ResNetEncoder(
+            depths=self.config["conv_s5"]["encoder_depths"], 
+            blocks=self.config["conv_s5"]["encoder_blocks"],
+            dtype=jnp.float32
+        )
+
+        # 2. Convolutional SSM Backbone
+        # This replaces the vector S5 StackedEncoderModel
+        self.conv_s5 = conv_s5_layers.StackedLayers(
+            ssm=self.ssm_init_fn,
+            n_layers=self.config["conv_s5"]["n_layers"],
+            training=True, # Always True to allow dropout if enabled
+            parallel=False, # Important: False for sequential inference/stepping TODO: have multiple SSM backbones, one that is parallel, one sequential
+            layer_activation=self.config["conv_s5"].get("activation", "gelu"),
+            use_norm=self.config["conv_s5"].get("use_norm", True),
+            prenorm=self.config["conv_s5"].get("prenorm", False)
+        )
+
+        # 3. Heads
+        # Actor Head (Action Mean)
+        self.actor_dense = fnn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+        self.actor_out = fnn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))
+
+        # Critic Head (Value)
+        self.critic_dense = fnn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+        self.critic_out = fnn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))
+
+        self.act_fn = fnn.relu
+        self.act_fn_t = fnn.tanh
+        
+        # Action Log Std
+        self.log_std_init = self.config['ppo']['log_std_init']
+        self.log_std = self.param("log_std", constant(self.log_std_init), (self.action_dim,))
+
+        # Projection for privileged state if needed
+        self.priv_encoder = fnn.Dense(64, kernel_init=orthogonal(np.sqrt(2)))
+
+    def __call__(self, obs, dones, hidden):
+        # Expecting obs to be a Dict or tuple if using mixed inputs.
+        # Let's assume obs is a Dictionary: {'image': [B, H, W, C], 'state': [B, D]}
+        
+        # 1. Process Visual Input (Gate Mask)
+        img_input = obs['image']
+        
+        # ResNet Expects [B, H, W, C]
+        img_embed = self.encoder(img_input) 
+        
+        # ConvS5 Expects sequential input [L, B, H, W, C]. 
+        # Since we are stepping 1 step, we add a time dimension L=1.
+        img_embed_seq = jnp.expand_dims(img_embed, axis=0) 
+        
+        # Reset hidden state if done (handled externally or here via masking)
+        # Note: ConvSSM hidden states are complex 4D tensors (B, H, W, P)
+        
+        # Forward pass through ConvSSM
+        # hidden is a list of states for each layer
+        # Output embedding is [L, B, H, W, C]
+        new_hidden, embedding_seq = self.conv_s5(img_embed_seq, hidden)
+        
+        # Remove time dimension -> [B, H, W, C]
+        embedding = jnp.squeeze(embedding_seq, axis=0)
+        
+        # 2. Global Average Pooling (Spatial Reduction)
+        # Convert [B, H, W, C] -> [B, C]
+        visual_feat = jnp.mean(embedding, axis=(1, 2))
+
+        # 3. Actor Path (Visual Only)
+        actor_h = self.actor_dense(visual_feat)
+        actor_h = self.act_fn(actor_h)
+        actor_mean = self.actor_out(actor_h)
+        actor_mean = self.act_fn_t(actor_mean)
+        
+        pi = distrax.MultivariateNormalDiag(loc=actor_mean, scale_diag=jnp.exp(self.log_std))
+
+        # 4. Critic Path (Visual + Privileged)
+        priv_state = obs['state']
+        priv_feat = self.priv_encoder(priv_state)
+        priv_feat = self.act_fn(priv_feat)
+        
+        # Fusion
+        critic_feat = jnp.concatenate([visual_feat, priv_feat], axis=-1)
+        
+        critic_h = self.critic_dense(critic_feat)
+        critic_h = self.act_fn(critic_h)
+        critic_val = self.critic_out(critic_h)
+        critic_val = jnp.squeeze(critic_val, axis=-1)
+
+        return new_hidden, pi, critic_val
 
 
 class ActorCriticPolicy(BasePolicy):
