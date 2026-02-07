@@ -10,6 +10,7 @@
 
 
 from flax import linen as nn
+import jax.numpy as jnp
 
 
 class SequenceLayer(nn.Module):
@@ -123,3 +124,19 @@ class StackedLayers(nn.Module):
             x_L, u = self.layers[i](u, initial_states[i])
             last_states.append(x_L)  # keep last state of each layer
         return last_states, u
+    
+    @staticmethod
+    def initialize_carry(c_cfg):
+        # Use a dummy key since the default state init fn is just zeros.
+        B = c_cfg["main"]["num_envs"]
+        latent_h = c_cfg["conv_s5"]["latent_h"]
+        latent_w = c_cfg["conv_s5"]["latent_w"]
+        P = c_cfg["conv_s5"]["ssm_size"] // 2
+        n_layers = c_cfg["conv_s5"]["n_layers"]
+
+        hidden_state = [
+            jnp.zeros((B, latent_h, latent_w, P), dtype=jnp.complex64)
+            for _ in range(n_layers)
+        ]
+        
+        return hidden_state
