@@ -354,7 +354,7 @@ class RolloutBuffer(BaseBuffer):
         self.observations, self.actions, self.rewards, self.advantages = None, None, None, None
         self.returns, self.episode_starts, self.values, self.log_probs = None, None, None, None
         self.generator_ready = False
-        if env_cfg is not None and env_cfg["main"].get("policy") == "S5":
+        if env_cfg is not None and env_cfg["main"].get("policy") in ["S5", "CONVS5"]:
             self.env_cfg = env_cfg
             self.swap_and_flatten = lambda arr: arr
         else:
@@ -372,7 +372,15 @@ class RolloutBuffer(BaseBuffer):
         self.values = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.log_probs = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         if hasattr(self, "env_cfg") and self.env_cfg is not None:
-            self.hidden_states = np.zeros((self.buffer_size, self.n_envs, self.env_cfg["s5"]["ssm_size"] // 2, self.env_cfg["s5"]["n_layers"]), dtype=np.complex64)
+            if self.env_cfg["main"]["policy"] == "S5":
+                self.hidden_states = np.zeros((self.buffer_size, self.n_envs, self.env_cfg["s5"]["ssm_size"] // 2, self.env_cfg["s5"]["n_layers"]), dtype=np.complex64)
+            elif self.env_cfg["main"]["policy"] == "CONVS5":
+                c_cfg = self.env_cfg["conv_s5"]
+                P_shape = (c_cfg["latent_h"], c_cfg["latent_w"], c_cfg["ssm_size"] // 2)
+                self.hidden_states = np.zeros(
+                    (self.buffer_size, self.n_envs) + P_shape + (c_cfg["n_layers"],),
+                    dtype=np.complex64,
+                )
             self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.advantages = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.generator_ready = False
@@ -540,7 +548,7 @@ class RolloutBuffer(BaseBuffer):
             start_idx += batch_size
 
     def _get_samples(self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None) -> RolloutBufferSamples:
-        if self.env_cfg["main"]["policy"] == "S5":
+        if self.env_cfg["main"]["policy"] in ["S5", "CONVS5"]:
             data = (
                 self.observations[:],
                 self.hidden_states[:],
@@ -754,6 +762,7 @@ class DictRolloutBuffer(RolloutBuffer):
         gae_lambda: float = 1,
         gamma: float = 0.99,
         n_envs: int = 1,
+        env_cfg: str = None,
     ):
 
         super(RolloutBuffer, self).__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
@@ -765,6 +774,11 @@ class DictRolloutBuffer(RolloutBuffer):
         self.observations, self.actions, self.rewards, self.advantages = None, None, None, None
         self.returns, self.episode_starts, self.values, self.log_probs = None, None, None, None
         self.generator_ready = False
+        
+        if env_cfg is not None and env_cfg["main"].get("policy") in ["S5", "CONVS5"]:
+            self.env_cfg = env_cfg
+            self.swap_and_flatten = lambda arr: arr
+
         self.reset()
 
     def reset(self) -> None:
@@ -780,6 +794,16 @@ class DictRolloutBuffer(RolloutBuffer):
         self.log_probs = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.advantages = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.generator_ready = False
+        
+        if hasattr(self, "env_cfg") and self.env_cfg is not None:
+            if self.env_cfg["main"]["policy"] == "S5":
+                self.hidden_states = np.zeros((self.buffer_size, self.n_envs, self.env_cfg["s5"]["ssm_size"] // 2, self.env_cfg["s5"]["n_layers"]), dtype=np.complex64)
+            elif self.env_cfg["main"]["policy"] == "CONVS5":
+                c_cfg = self.env_cfg["conv_s5"]
+                self.hidden_states = np.zeros((self.buffer_size, self.n_envs, c_cfg["latent_h"], c_cfg["latent_w"], c_cfg["ssm_size"] // 2, c_cfg["n_layers"]), dtype=np.complex64)
+            
+            self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+
         super(RolloutBuffer, self).reset()
 
     def add(
@@ -822,6 +846,34 @@ class DictRolloutBuffer(RolloutBuffer):
         if self.pos == self.buffer_size:
             self.full = True
 
+    def fast_add(
+        self,
+        obs: Dict[str, np.ndarray],
+        action: np.ndarray,
+        reward: np.ndarray,
+        episode_start: np.ndarray,
+        value: np.ndarray,
+        log_prob: np.ndarray,
+        hidden_state: np.ndarray,
+        dones: np.ndarray,
+    ) -> None:
+        for key in self.observations.keys():
+            self.observations[key][self.pos] = obs[key]
+        
+        self.actions[self.pos] = action
+        self.rewards[self.pos] = reward
+        self.episode_starts[self.pos] = episode_start
+        self.values[self.pos] = value.ravel()
+        self.log_probs[self.pos] = log_prob.ravel()
+        
+        if hidden_state is not None:
+            self.hidden_states[self.pos] = hidden_state
+            self.dones[self.pos] = dones
+
+        self.pos += 1
+        if self.pos == self.buffer_size:
+            self.full = True
+
     def get(self, batch_size: Optional[int] = None) -> Generator[DictRolloutBufferSamples, None, None]:
         assert self.full, ""
         indices = np.random.permutation(self.buffer_size * self.n_envs)
@@ -847,6 +899,17 @@ class DictRolloutBuffer(RolloutBuffer):
             start_idx += batch_size
 
     def _get_samples(self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None) -> DictRolloutBufferSamples:
+        if hasattr(self, "env_cfg") and self.env_cfg["main"]["policy"] in ["S5", "CONVS5"]:
+            return DictRolloutBufferSamples(
+                observations={key: self.to_torch(obs[:]) for (key, obs) in self.observations.items()},
+                actions=self.to_torch(self.actions[:]),
+                old_values=self.to_torch(self.values[:]),
+                old_log_prob=self.to_torch(self.log_probs[:]),
+                advantages=self.to_torch(self.advantages[:]),
+                returns=self.to_torch(self.returns[:]),
+                hidden_states=self.to_torch(self.hidden_states[:]),
+                dones=self.to_torch(self.dones[:]),
+            )
 
         return DictRolloutBufferSamples(
             observations={key: self.to_torch(obs[batch_inds]) for (key, obs) in self.observations.items()},
@@ -855,4 +918,6 @@ class DictRolloutBuffer(RolloutBuffer):
             old_log_prob=self.to_torch(self.log_probs[batch_inds].flatten()),
             advantages=self.to_torch(self.advantages[batch_inds].flatten()),
             returns=self.to_torch(self.returns[batch_inds].flatten()),
+            hidden_states=None,
+            dones=None,
         )
