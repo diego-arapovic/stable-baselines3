@@ -599,7 +599,7 @@ class PPOJaxConvPolicy(PPOJaxPolicy):
         # Initialize Observation        
         init_obs = {
             'image': jnp.zeros(img_shape),
-            'state': jnp.zeros(priv_shape)
+            'priv_state': jnp.zeros(priv_shape)
         }
         init_dones = jnp.zeros((B,))
         
@@ -611,7 +611,7 @@ class PPOJaxConvPolicy(PPOJaxPolicy):
         P = ssm_size // 2 
         
         init_hstate = [
-            jnp.zeros((B, latent_h, latent_w, P)) 
+            jnp.zeros((B, latent_h, latent_w, P), dtype=jnp.complex64) 
             for _ in range(c_cfg["n_layers"])
         ]
 
@@ -633,6 +633,17 @@ class PPOJaxConvPolicy(PPOJaxPolicy):
 
         return self.noise_key
     
+    @staticmethod
+    @jax.jit
+    def _predict_all(train_state, obervations, dones, hiddens, key):
+        hidden_state, dist, values = train_state.apply_fn(train_state.params, obervations, dones, hiddens)
+        actions = dist.sample(seed=key)
+        log_probs = dist.log_prob(actions)
+        clipped_actions = jnp.clip(actions, -1.0, 1.0)
+        # hidden_state is list of (B, H, W, P) -> stack (L, B, H, W, P) -> transpose (B, H, W, P, L)
+        hidden_stack = jnp.stack(hidden_state).transpose(1, 2, 3, 4, 0)
+        return hidden_stack, hidden_state, jnp.squeeze(actions, axis=0), jnp.squeeze(clipped_actions, axis=0), jnp.squeeze(log_probs, axis=0), jnp.squeeze(values, axis=0)
+
 
 class ActorCriticConvS5(fnn.Module):
     action_dim: int
@@ -687,13 +698,25 @@ class ActorCriticConvS5(fnn.Module):
         
         # 1. Process Visual Input (Gate Mask)
         img_input = obs['image']
-        
-        # ResNet Expects [B, H, W, C]
-        img_embed = self.encoder(img_input) 
+
+        # ResNet Expects [B, H, W, C]. If input is [T, B, H, W, C], flatten T and B.
+        is_sequence = False
+        if img_input.ndim == 5:
+            is_sequence = True
+            T, B, H, W, C = img_input.shape
+            img_input_enc = img_input.reshape(T * B, H, W, C)
+        else:
+            img_input_enc = img_input
+
+        img_embed_enc = self.encoder(img_input_enc) 
         
         # ConvS5 Expects sequential input [L, B, H, W, C]. 
-        # Since we are stepping 1 step, we add a time dimension L=1. Then remove again.
-        img_embed_seq = jnp.expand_dims(img_embed, axis=0)
+        if is_sequence:
+            new_shape = (T, B) + img_embed_enc.shape[1:]
+            img_embed_seq = img_embed_enc.reshape(new_shape)
+        else:
+            img_embed_seq = jnp.expand_dims(img_embed_enc, axis=0)
+            
         new_hidden, embedding_seq = self.conv_s5(img_embed_seq, hidden)
         embedding = jnp.squeeze(embedding_seq, axis=0)
         
@@ -707,10 +730,16 @@ class ActorCriticConvS5(fnn.Module):
         actor_mean = self.actor_out(actor_h)
         actor_mean = self.act_fn_t(actor_mean)
         
+        # Expand dims to (1, B, A) for PPO compatibility
+        actor_mean = jnp.expand_dims(actor_mean, axis=0)
+        
         pi = distrax.MultivariateNormalDiag(loc=actor_mean, scale_diag=jnp.exp(self.log_std))
 
         # 4. Critic Path (Visual + Privileged)
-        priv_state = obs['state']
+        priv_state = obs['priv_state']
+        if priv_state.ndim == 3:
+            priv_state = jnp.squeeze(priv_state, axis=0)
+            
         priv_feat = self.priv_encoder(priv_state)
         priv_feat = self.act_fn(priv_feat)
         
@@ -721,6 +750,9 @@ class ActorCriticConvS5(fnn.Module):
         critic_h = self.act_fn(critic_h)
         critic_val = self.critic_out(critic_h)
         critic_val = jnp.squeeze(critic_val, axis=-1)
+        
+        # Expand dims to (1, B) for PPO compatibility
+        critic_val = jnp.expand_dims(critic_val, axis=0)
 
         return new_hidden, pi, critic_val
 
