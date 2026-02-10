@@ -559,7 +559,7 @@ class RolloutBuffer(BaseBuffer):
                 self.advantages[:],
                 self.returns[:],
             )
-            return RolloutBufferSamples(*tuple(map(th.as_tensor, data)))
+            return RolloutBufferSamples(*data)
         else:
             data = (
                 self.observations[batch_inds],
@@ -902,14 +902,14 @@ class DictRolloutBuffer(RolloutBuffer):
     def _get_samples(self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None) -> DictRolloutBufferSamples:
         if hasattr(self, "env_cfg") and self.env_cfg["main"]["policy"] in ["S5", "CONVS5"]:
             return DictRolloutBufferSamples(
-                observations={key: th.as_tensor(obs[:]) for (key, obs) in self.observations.items()},
-                actions=th.as_tensor(self.actions[:]),
-                old_values=th.as_tensor(self.values[:]),
-                old_log_prob=th.as_tensor(self.log_probs[:]),
-                advantages=th.as_tensor(self.advantages[:]),
-                returns=th.as_tensor(self.returns[:]),
-                hidden_states=th.as_tensor(self.hidden_states[:]),
-                dones=th.as_tensor(self.dones[:]),
+                observations={key: obs[:] for (key, obs) in self.observations.items()},
+                actions=self.actions[:],
+                old_values=self.values[:],
+                old_log_prob=self.log_probs[:],
+                advantages=self.advantages[:],
+                returns=self.returns[:],
+                hidden_states=self.hidden_states[:],
+                dones=self.dones[:],
             )
 
         return DictRolloutBufferSamples(
