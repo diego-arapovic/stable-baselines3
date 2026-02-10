@@ -718,7 +718,11 @@ class ActorCriticConvS5(fnn.Module):
             img_embed_seq = jnp.expand_dims(img_embed_enc, axis=0)
             
         new_hidden, embedding_seq = self.conv_s5(img_embed_seq, hidden)
-        embedding = jnp.squeeze(embedding_seq, axis=0)
+        
+        if is_sequence:
+            embedding = embedding_seq.reshape(T * B, *embedding_seq.shape[2:])
+        else:
+            embedding = jnp.squeeze(embedding_seq, axis=0)
         
         # 2. Pooling (Spatial Reduction)
         # [B, H, W, C] -> [B, C*2]
@@ -730,14 +734,19 @@ class ActorCriticConvS5(fnn.Module):
         actor_mean = self.actor_out(actor_h)
         actor_mean = self.act_fn_t(actor_mean)
         
-        # Expand dims to (1, B, A) for PPO compatibility
-        actor_mean = jnp.expand_dims(actor_mean, axis=0)
+        if is_sequence:
+            actor_mean = actor_mean.reshape(T, B, self.action_dim)
+        else:
+            # Expand dims to (1, B, A) for PPO compatibility
+            actor_mean = jnp.expand_dims(actor_mean, axis=0)
         
         pi = distrax.MultivariateNormalDiag(loc=actor_mean, scale_diag=jnp.exp(self.log_std))
 
         # 4. Critic Path (Visual + Privileged)
         priv_state = obs['priv_state']
-        if priv_state.ndim == 3:
+        if is_sequence:
+            priv_state = priv_state.reshape(T * B, -1)
+        elif priv_state.ndim == 3:
             priv_state = jnp.squeeze(priv_state, axis=0)
             
         priv_feat = self.priv_encoder(priv_state)
@@ -751,8 +760,11 @@ class ActorCriticConvS5(fnn.Module):
         critic_val = self.critic_out(critic_h)
         critic_val = jnp.squeeze(critic_val, axis=-1)
         
-        # Expand dims to (1, B) for PPO compatibility
-        critic_val = jnp.expand_dims(critic_val, axis=0)
+        if is_sequence:
+            critic_val = critic_val.reshape(T, B)
+        else:
+            # Expand dims to (1, B) for PPO compatibility
+            critic_val = jnp.expand_dims(critic_val, axis=0)
 
         return new_hidden, pi, critic_val
 
