@@ -559,7 +559,8 @@ class RolloutBuffer(BaseBuffer):
                 self.advantages[:],
                 self.returns[:],
             )
-        else: 
+            return RolloutBufferSamples(*tuple(map(th.as_tensor, data)))
+        else:
             data = (
                 self.observations[batch_inds],
                 self.hidden_states[:],
@@ -570,7 +571,7 @@ class RolloutBuffer(BaseBuffer):
                 self.advantages[batch_inds].flatten(),
                 self.returns[batch_inds].flatten(),
             )
-        return RolloutBufferSamples(*tuple(map(self.to_torch, data)))
+            return RolloutBufferSamples(*tuple(map(self.to_torch, data)))
 
 
 class DictReplayBuffer(ReplayBuffer):
@@ -901,14 +902,14 @@ class DictRolloutBuffer(RolloutBuffer):
     def _get_samples(self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None) -> DictRolloutBufferSamples:
         if hasattr(self, "env_cfg") and self.env_cfg["main"]["policy"] in ["S5", "CONVS5"]:
             return DictRolloutBufferSamples(
-                observations={key: self.to_torch(obs[:]) for (key, obs) in self.observations.items()},
-                actions=self.to_torch(self.actions[:]),
-                old_values=self.to_torch(self.values[:]),
-                old_log_prob=self.to_torch(self.log_probs[:]),
-                advantages=self.to_torch(self.advantages[:]),
-                returns=self.to_torch(self.returns[:]),
-                hidden_states=self.to_torch(self.hidden_states[:]),
-                dones=self.to_torch(self.dones[:]),
+                observations={key: th.as_tensor(obs[:]) for (key, obs) in self.observations.items()},
+                actions=th.as_tensor(self.actions[:]),
+                old_values=th.as_tensor(self.values[:]),
+                old_log_prob=th.as_tensor(self.log_probs[:]),
+                advantages=th.as_tensor(self.advantages[:]),
+                returns=th.as_tensor(self.returns[:]),
+                hidden_states=th.as_tensor(self.hidden_states[:]),
+                dones=th.as_tensor(self.dones[:]),
             )
 
         return DictRolloutBufferSamples(
