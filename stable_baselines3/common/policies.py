@@ -665,7 +665,7 @@ class ActorCriticConvS5(fnn.Module):
             ssm=self.ssm_init_fn,
             n_layers=self.config["conv_s5"]["n_layers"],
             training=True, # Always True to allow dropout if enabled
-            parallel=False, # Important: False for sequential inference/stepping TODO: have multiple SSM backbones, one that is parallel, one sequential
+            parallel=True, # Important: False for sequential inference/stepping TODO: have multiple SSM backbones, one that is parallel, one sequential
             layer_activation=self.config["conv_s5"].get("activation", "gelu"),
             use_norm=self.config["conv_s5"].get("use_norm", True),
             prenorm=self.config["conv_s5"].get("prenorm", False)
