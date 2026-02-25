@@ -52,7 +52,7 @@ class SequenceLayer(nn.Module):
             deterministic=not self.training,
         )
 
-    def __call__(self, u, x0):
+    def __call__(self, u, x0, d):
         if self.per_layer_skip:
             skip = u
         else:
@@ -61,7 +61,7 @@ class SequenceLayer(nn.Module):
         if self.use_norm:
             if self.prenorm:
                 u = self.norm(u)
-        x_L, u = self.seq(u, x0)
+        x_L, u = self.seq(u, x0, d)
         u = self.drop(u)
         u = skip + u
         if self.use_norm:
@@ -105,7 +105,7 @@ class StackedLayers(nn.Module):
             for _ in range(self.n_layers)
         ]
 
-    def __call__(self, u, initial_states):
+    def __call__(self, u, initial_states, dones):
         # u is shape (L, bsz, d_in, im_H, im_W)
         # x0s is a list of initial arrays each of shape (bsz, d_model, im_H, im_W)
         last_states = []
@@ -121,7 +121,7 @@ class StackedLayers(nn.Module):
                 elif i == 11:
                     u = u + layer12_in
 
-            x_L, u = self.layers[i](u, initial_states[i])
+            x_L, u = self.layers[i](u, initial_states[i], dones)
             last_states.append(x_L)  # keep last state of each layer
         return last_states, u
     

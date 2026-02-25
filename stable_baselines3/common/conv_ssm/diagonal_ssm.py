@@ -259,7 +259,7 @@ class ConvS5SSM(nn.Module):
                 ssm_var.value = init_discrete()
             self.ssm = ssm_var.value
 
-    def __call__(self, input_sequence, x0):
+    def __call__(self, input_sequence, x0, d):
         """
         input sequence is shape (L, bsz, H, W, U)
         x0 is (bsz, H, W, U)
@@ -269,18 +269,24 @@ class ConvS5SSM(nn.Module):
         """
         if self.parallel:
             # TODO: right now parallel version assumes x_init is zeros
-            x_last, ys = diagonal_scans.apply_convSSM_parallel(self.A_bar,
-                                                               self.B_bar,
-                                                               self.C_tilde,
-                                                               input_sequence,
-                                                               x0)
+            x_last, ys = diagonal_scans.apply_convSSM_parallel(
+                self.A_bar,
+                self.B_bar,
+                self.C_tilde,
+                input_sequence,
+                x0,
+                d,
+            )
 
         else:
             # For sequential generation (e.g. autoregressive decoding)
-            x_last, ys = diagonal_scans.apply_convSSM_sequential(*self.ssm,
-                                                                 self.C_tilde,
-                                                                 input_sequence,
-                                                                 x0)
+            x_last, ys = diagonal_scans.apply_convSSM_sequential(
+                *self.ssm,
+                self.C_tilde,
+                input_sequence,
+                x0,
+                d,
+            )
         if self.C_D_config == "standard":
             ys = self.C_D_conv(ys, input_sequence)
         elif self.C_D_config == "resnet":

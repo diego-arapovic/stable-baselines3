@@ -717,7 +717,7 @@ class ActorCriticConvS5(fnn.Module):
         else:
             img_embed_seq = jnp.expand_dims(img_embed_enc, axis=0)
             
-        new_hidden, embedding_seq = self.conv_s5(img_embed_seq, hidden)
+        new_hidden, embedding_seq = self.conv_s5(img_embed_seq, hidden, dones)
         
         if is_sequence:
             embedding = embedding_seq.reshape(T * B, *embedding_seq.shape[2:])
