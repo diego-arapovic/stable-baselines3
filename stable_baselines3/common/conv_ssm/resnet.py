@@ -75,9 +75,10 @@ class ResNetBlock(nn.Module):
             skip = nn.Conv(self.depth, [1, 1], use_bias=False, 
                            dtype=self.dtype, name='skip')(skip)
 
-        x = nn.elu(nn.GroupNorm(dtype=self.dtype)(x))
+        num_groups = min(32, self.depth) if self.depth % 32 != 0 else 32
+        x = nn.elu(nn.GroupNorm(num_groups=num_groups, dtype=self.dtype)(x))
         x = nn.Conv(self.depth, [3, 3], dtype=self.dtype)(x)
-        x = nn.elu(nn.GroupNorm(dtype=self.dtype)(x))
+        x = nn.elu(nn.GroupNorm(num_groups=num_groups, dtype=self.dtype)(x))
         x = nn.Conv(self.depth, [3, 3], dtype=self.dtype, use_bias=False)(x)
         x = AddBias(dtype=self.dtype)(x)
         return skip + 0.1 * x 

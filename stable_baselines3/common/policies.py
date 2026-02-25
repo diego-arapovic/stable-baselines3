@@ -578,12 +578,12 @@ class PPOJaxConvPolicy(PPOJaxPolicy):
         # Image: [B, H, W, C], Privileged: [B, D_priv]
         B = self.env_cfg["main"]["num_envs"]
         H, W = self.env_cfg["image_obs"]["height"], self.env_cfg["image_obs"]["width"]
-        img_shape = (B, H, W, 1)
-        priv_shape = (B, 20)
+        img_shape = (1, B, H, W, 1)
+        priv_shape = (1, B, 20)
         
         pooling_factor = 2 ** (len(self.env_cfg["conv_s5"]["encoder"]["depths"]) - 1)
-        latent_w = img_shape[2] // pooling_factor
-        latent_h = img_shape[1] // pooling_factor
+        latent_w = img_shape[3] // pooling_factor
+        latent_h = img_shape[2] // pooling_factor
         self.env_cfg["conv_s5"]["pooling_factor"] = pooling_factor
         self.env_cfg["conv_s5"]["latent_w"] = latent_w
         self.env_cfg["conv_s5"]["latent_h"] = latent_h
@@ -601,7 +601,7 @@ class PPOJaxConvPolicy(PPOJaxPolicy):
             'image': jnp.zeros(img_shape),
             'priv_state': jnp.zeros(priv_shape)
         }
-        init_dones = jnp.zeros((B,))
+        init_dones = jnp.zeros((1, B))
         
         # Initialize Hidden State
         # ConvS5 hidden state is a list of tensors: [layers, B, H, W, P]
@@ -610,10 +610,7 @@ class PPOJaxConvPolicy(PPOJaxPolicy):
         # Complex numbers handling
         P = ssm_size // 2 
         
-        init_hstate = [
-            jnp.zeros((B, latent_h, latent_w, P), dtype=jnp.complex64) 
-            for _ in range(c_cfg["n_layers"])
-        ]
+        init_hstate = conv_s5_layers.StackedLayers.initialize_carry(self.env_cfg)
 
         self.schedule = optax.linear_schedule(
             init_value=self.env_cfg["ppo"]["learning_rate"]["start"],
@@ -651,120 +648,73 @@ class ActorCriticConvS5(fnn.Module):
     ssm_init_fn: Any
 
     def setup(self):
-        # 1. Visual Encoder (ResNet)
-        # Config example: depths=[32, 64, 128], blocks=1
         self.encoder = ResNetEncoder(
             depths=self.config["conv_s5"]["encoder"]["depths"], 
             blocks=self.config["conv_s5"]["encoder"]["blocks"],
             dtype=jnp.float32
         )
 
-        # 2. Convolutional SSM Backbone
-        # This replaces the vector S5 StackedEncoderModel
         self.conv_s5 = conv_s5_layers.StackedLayers(
             ssm=self.ssm_init_fn,
             n_layers=self.config["conv_s5"]["n_layers"],
             training=True, # Always True to allow dropout if enabled
-            parallel=True, # Important: False for sequential inference/stepping TODO: have multiple SSM backbones, one that is parallel, one sequential
+            parallel=True, # Important: False for sequential inference/stepping
             layer_activation=self.config["conv_s5"].get("activation", "gelu"),
             use_norm=self.config["conv_s5"].get("use_norm", True),
             prenorm=self.config["conv_s5"].get("prenorm", False)
         )
         
-        # 3. Spatial Softmax
-        self.spatial_softmax = SpatialSoftmax(height=self.config["conv_s5"]["latent_h"], width=self.config["conv_s5"]["latent_w"])
+        self.spatial_softmax = SpatialSoftmax(
+            height=self.config["conv_s5"]["latent_h"], 
+            width=self.config["conv_s5"]["latent_w"]
+        )
 
-        # 4. Heads
-        # Actor Head (Action Mean)
         self.actor_dense = fnn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
         self.actor_out = fnn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))
 
-        # Critic Head (Value)
         self.critic_dense = fnn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
         self.critic_out = fnn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))
 
-        self.act_fn = fnn.relu
-        self.act_fn_t = fnn.tanh
-        
-        # Action Log Std
-        self.log_std_init = self.config['ppo']['log_std_init']
-        self.log_std = self.param("log_std", constant(self.log_std_init), (self.action_dim,))
-
-        # Projection for privileged state if needed
         self.priv_encoder = fnn.Dense(64, kernel_init=orthogonal(np.sqrt(2)))
+        
+        self.log_std = self.param(
+            "log_std", 
+            constant(self.config['ppo']['log_std_init']), 
+            (self.action_dim,)
+        )
 
     def __call__(self, obs, dones, hidden):
-        # Assume obs is a Dictionary: {'image': [B, H, W, C], 'state': [B, D]}
+        # obs: {'image': [L, B, H, W, C], 'priv_state': [L, B, D]}
         
-        # 1. Process Visual Input (Gate Mask)
         img_input = obs['image']
+        L, B, H, W, C = img_input.shape
 
-        # ResNet Expects [B, H, W, C]. If input is [T, B, H, W, C], flatten T and B.
-        is_sequence = False
-        if img_input.ndim == 5:
-            is_sequence = True
-            T, B, H, W, C = img_input.shape
-            img_input_enc = img_input.reshape(T * B, H, W, C)
-        else:
-            img_input_enc = img_input
-
-        img_embed_enc = self.encoder(img_input_enc) 
+        flat_img = img_input.reshape(L * B, H, W, C)
+        flat_img_embed = self.encoder(flat_img)
         
-        # ConvS5 Expects sequential input [L, B, H, W, C]. 
-        if is_sequence:
-            new_shape = (T, B) + img_embed_enc.shape[1:]
-            img_embed_seq = img_embed_enc.reshape(new_shape)
-        else:
-            img_embed_seq = jnp.expand_dims(img_embed_enc, axis=0)
-            
-        new_hidden, embedding_seq = self.conv_s5(img_embed_seq, hidden, dones)
+        _, H_e, W_e, C_e = flat_img_embed.shape
+        img_embed_seq = flat_img_embed.reshape(L, B, H_e, W_e, C_e)
+        new_hidden, embedding = self.conv_s5(img_embed_seq, hidden, dones)
         
-        if is_sequence:
-            embedding = embedding_seq.reshape(T * B, *embedding_seq.shape[2:])
-        else:
-            embedding = jnp.squeeze(embedding_seq, axis=0)
+        # [L, B, H, W, C] -> [L*B, H, W, C]
+        flat_embedding = embedding.reshape(L * B, H_e, W_e, C_e)
+        flat_visual_feat = self.spatial_softmax(flat_embedding)
         
-        # 2. Pooling (Spatial Reduction)
-        # [B, H, W, C] -> [B, C*2]
-        visual_feat = self.spatial_softmax(embedding)
+        visual_feat = flat_visual_feat.reshape(L, B, -1)
         
-        # 3. Actor Path (Visual Only)
-        actor_h = self.actor_dense(visual_feat)
-        actor_h = self.act_fn(actor_h)
-        actor_mean = self.actor_out(actor_h)
-        actor_mean = self.act_fn_t(actor_mean)
-        
-        if is_sequence:
-            actor_mean = actor_mean.reshape(T, B, self.action_dim)
-        else:
-            # Expand dims to (1, B, A) for PPO compatibility
-            actor_mean = jnp.expand_dims(actor_mean, axis=0)
+        # --- ACTOR PATH ---
+        actor_h = fnn.relu(self.actor_dense(visual_feat))
+        actor_mean = fnn.tanh(self.actor_out(actor_h))
         
         pi = distrax.MultivariateNormalDiag(loc=actor_mean, scale_diag=jnp.exp(self.log_std))
 
-        # 4. Critic Path (Visual + Privileged)
-        priv_state = obs['priv_state']
-        if is_sequence:
-            priv_state = priv_state.reshape(T * B, -1)
-        elif priv_state.ndim == 3:
-            priv_state = jnp.squeeze(priv_state, axis=0)
-            
-        priv_feat = self.priv_encoder(priv_state)
-        priv_feat = self.act_fn(priv_feat)
-        
-        # Fusion
+        # --- CRITIC PATH ---
+        priv_feat = fnn.relu(self.priv_encoder(obs['priv_state']))
         critic_feat = jnp.concatenate([visual_feat, priv_feat], axis=-1)
         
-        critic_h = self.critic_dense(critic_feat)
-        critic_h = self.act_fn(critic_h)
+        critic_h = fnn.relu(self.critic_dense(critic_feat))
         critic_val = self.critic_out(critic_h)
         critic_val = jnp.squeeze(critic_val, axis=-1)
-        
-        if is_sequence:
-            critic_val = critic_val.reshape(T, B)
-        else:
-            # Expand dims to (1, B) for PPO compatibility
-            critic_val = jnp.expand_dims(critic_val, axis=0)
 
         return new_hidden, pi, critic_val
 

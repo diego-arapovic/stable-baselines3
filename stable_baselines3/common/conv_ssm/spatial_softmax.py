@@ -1,6 +1,5 @@
 import flax.linen as fnn
 import jax.numpy as jnp
-import distrax
 
 class SpatialSoftmax(fnn.Module):
     """
