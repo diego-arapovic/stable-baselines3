@@ -49,12 +49,12 @@ def conv_binary_operator_reset(q_i, q_j):
     c_j_BU = np.expand_dims(c_j, (1, 2, 3))   # (bsz, 1, 1, 1) for BU
 
     # State transition (wipes A_i if reset)
-    AA = (A_j * A_i) * (1 - c_j_A) + A_j * c_j_A
+    AA = A_j * (A_i * (1 - c_j_A) + c_j_A) # equally AA = (A_j * A_i) * (1 - c_j_A) + A_j * c_j_A
 
     # Accumulated input/hidden state
     A_j_exp = np.expand_dims(A_j, (1, 2))     # (bsz, 1, 1, P)
     A_jBU_i = A_j_exp * BU_i
-    BU_out = (A_jBU_i + BU_j) * (1 - c_j_BU) + BU_j * c_j_BU
+    BU_out = A_jBU_i * (1 - c_j_BU) + BU_j # equally BU_out = (A_jBU_i + BU_j) * (1 - c_j_BU) + BU_j * c_j_BU
 
     # Reset propagation
     c_out = c_i * (1 - c_j) + c_j
@@ -82,14 +82,19 @@ def apply_convSSM_parallel(A, B, C, us, x0, d):
     bsz = us.shape[1]
     
     Bus = vmap_conv(B, np.complex64(us))
-    Bus = Bus.at[0].add(np.expand_dims(A, (0, 1, 2)) * x0)
+    x0_expanded = np.expand_dims(A, (0, 1, 2)) * x0
 
     if d is None:
+        Bus = Bus.at[0].add(x0_expanded)
         As = A * np.ones((L,) + A.shape)
         _, xs = lax.associative_scan(conv_binary_operator, (As, Bus))
     else:
         if d.shape != (L, bsz):
             raise ValueError(f"Reset array 'd' must have shape {(L, bsz)}, but got {d.shape}")
+        
+        # d[0] has shape (bsz,) -> expand to match x0 (bsz, 1, 1, 1)
+        reset_mask = np.expand_dims(1 - d[0], (1, 2, 3))
+        Bus = Bus.at[0].add(x0_expanded * reset_mask)
         
         # batch (L, bsz, P) for independent batch resets
         As = np.broadcast_to(A, (L, bsz, A.shape[0]))
