@@ -462,6 +462,24 @@ class PPOJaxPolicy():
         """
         self.key, self.noise_key = jax.random.split(self.key, 2)
 
+    def update_schedule(self, total_timesteps: int) -> None:
+        n_epochs = self.env_cfg["ppo"]["n_epochs"]
+        batch_size = self.env_cfg["ppo"]["batch_size"]
+        n_steps = self.env_cfg["ppo"]["n_steps"]
+        num_envs = self.env_cfg["main"]["num_envs"]
+
+        buffer_size = n_steps * num_envs
+        num_rollouts = total_timesteps // buffer_size
+        num_minibatches = (num_envs + batch_size - 1) // batch_size
+        transition_steps = num_rollouts * n_epochs * num_minibatches
+
+        self.schedule = optax.linear_schedule(init_value=self.env_cfg["ppo"]["learning_rate"]["start"],
+                                                end_value=self.env_cfg["ppo"]["learning_rate"]["end"],
+                                                transition_steps=transition_steps
+                                                )
+        self.tx = optax.chain(optax.clip_by_global_norm(0.5), optax.adam(self.schedule, eps=1e-5))
+        self.train_state = self.train_state.replace(tx=self.tx)
+
     def forward(self, obs: np.ndarray, deterministic: bool = False) -> np.ndarray:
         return self._predict(obs, deterministic=deterministic)
 
