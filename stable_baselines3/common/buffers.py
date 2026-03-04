@@ -372,9 +372,9 @@ class RolloutBuffer(BaseBuffer):
         self.values = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.log_probs = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         if hasattr(self, "env_cfg") and self.env_cfg is not None:
-            # if self.env_cfg["main"]["policy"] == "S5":
+            # if self.env_cfg["main"].get("policy", None) == "S5":
             #     self.hidden_states = np.zeros((self.buffer_size, self.n_envs, self.env_cfg["s5"]["ssm_size"] // 2, self.env_cfg["s5"]["n_layers"]), dtype=np.complex64)
-            # elif self.env_cfg["main"]["policy"] == "CONVS5":
+            # elif self.env_cfg["main"].get("policy", None) == "CONVS5":
             #     c_cfg = self.env_cfg["conv_s5"]
             #     P_shape = (c_cfg["latent_h"], c_cfg["latent_w"], c_cfg["ssm_size"] // 2)
             #     self.hidden_states = np.zeros(
@@ -548,7 +548,7 @@ class RolloutBuffer(BaseBuffer):
             start_idx += batch_size
 
     def _get_samples(self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None) -> RolloutBufferSamples:
-        if self.env_cfg["main"]["policy"] in ["S5", "CONVS5"]:
+        if self.env_cfg["main"].get("policy", None) in ["S5", "CONVS5"]:
             data = (
                 self.observations[:],
                 # self.hidden_states[:],

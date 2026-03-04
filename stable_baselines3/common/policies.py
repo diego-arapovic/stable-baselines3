@@ -443,13 +443,14 @@ class PPOJaxPolicy():
                                                 )
         self.tx = optax.chain(optax.clip_by_global_norm(0.5), optax.adam(self.schedule, eps=1e-5))
         
+        def apply_fn(params, *args, **kwargs):
+            return self.s5net.apply({'params': params}, *args, **kwargs)
+
         self.train_state = TrainState.create(
-            apply_fn=self.s5net.apply,
-            params=self.s5net.init(self.key, init_obs, init_dones, init_hstate),
+            apply_fn=apply_fn,
+            params=self.s5net.init(self.key, init_obs, init_dones, init_hstate)['params'],
             tx=self.tx,
             )
-
-        self.s5net.apply = jax.jit(self.s5net.apply)
 
         self.reset_noise()
 
@@ -575,13 +576,13 @@ class PPOJaxConvPolicy(PPOJaxPolicy):
             C_D_config=c_cfg.get("C_D_config", "resnet")
         )
         
-        # Image: [B, H, W, C], Privileged: [B, D_priv]
+        # Image: [T, B, H, W, C], Privileged: [T, B, D_priv]
         B = self.env_cfg["main"]["num_envs"]
         H, W = self.env_cfg["image_obs"]["height"], self.env_cfg["image_obs"]["width"]
         img_shape = (1, B, H, W, 1)
         priv_shape = (1, B, 20)
         
-        pooling_factor = 2 ** (len(self.env_cfg["conv_s5"]["encoder"]["depths"]) - 1)
+        pooling_factor = 2 ** (len(c_cfg["encoder"]["depths"]) - 1)
         latent_w = img_shape[3] // pooling_factor
         latent_h = img_shape[2] // pooling_factor
         self.env_cfg["conv_s5"]["pooling_factor"] = pooling_factor
@@ -619,13 +620,15 @@ class PPOJaxConvPolicy(PPOJaxPolicy):
         )
         self.tx = optax.chain(optax.clip_by_global_norm(0.5), optax.adam(self.schedule, eps=1e-5))
         
+        def apply_fn(params, *args, **kwargs):
+            return self.s5net.apply({'params': params}, *args, **kwargs)
+
         self.train_state = TrainState.create(
-            apply_fn=self.s5net.apply,
-            params=self.s5net.init(self.key, init_obs, init_dones, init_hstate),
+            apply_fn=apply_fn,
+            params=self.s5net.init(self.key, init_obs, init_dones, init_hstate)['params'],
             tx=self.tx,
         )
 
-        self.s5net.apply = jax.jit(self.s5net.apply)
         self.reset_noise()
 
         return self.noise_key
