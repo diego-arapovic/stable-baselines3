@@ -594,32 +594,26 @@ class PPOJaxConvPolicy(PPOJaxPolicy):
             C_D_config=c_cfg.get("C_D_config", "resnet")
         )
         
-        # Image: [T, B, H, W, C], Privileged: [T, B, D_priv]
         B = self.env_cfg["main"]["num_envs"]
         H, W = self.env_cfg["image_obs"]["height"], self.env_cfg["image_obs"]["width"]
-        img_shape = (1, B, H, W, 1)
-        priv_shape = (1, B, 20)
-        
+
         pooling_factor = 2 ** (len(c_cfg["encoder"]["depths"]) - 1)
-        latent_w = img_shape[3] // pooling_factor
-        latent_h = img_shape[2] // pooling_factor
+        latent_w = W // pooling_factor
+        latent_h = H // pooling_factor
         self.env_cfg["conv_s5"]["pooling_factor"] = pooling_factor
         self.env_cfg["conv_s5"]["latent_w"] = latent_w
         self.env_cfg["conv_s5"]["latent_h"] = latent_h
-        
+
         self.s5net = ActorCriticConvS5(
             action_dim=4,
             config=self.env_cfg,
             ssm_init_fn=ssm_init_fn,
         )
-        
+
         key, self.key = jax.random.split(key)
-        
-        # Initialize Observation        
-        init_obs = {
-            'image': jnp.zeros(img_shape),
-            'priv_state': jnp.zeros(priv_shape)
-        }
+
+        obs_dim = self.observation_space.shape[0]
+        init_obs = jnp.zeros((1, B, obs_dim))
         init_dones = jnp.zeros((1, B))
         
         # Initialize Hidden State
@@ -669,25 +663,33 @@ class ActorCriticConvS5(fnn.Module):
     ssm_init_fn: Any
 
     def setup(self):
+        cfg = self.config
+        self.img_h = cfg["image_obs"]["height"]
+        self.img_w = cfg["image_obs"]["width"]
+        self.img_dim = self.img_h * self.img_w
+        self.act_dim = cfg["cnn_policy"]["other_obs_dim"]
+        self.priv_dim = cfg["cnn_policy"]["critic_obs_dim"]
+        self.n_stack = cfg["main"]["n_stack"]
+
         self.encoder = ResNetEncoder(
-            depths=self.config["conv_s5"]["encoder"]["depths"], 
-            blocks=self.config["conv_s5"]["encoder"]["blocks"],
+            depths=cfg["conv_s5"]["encoder"]["depths"],
+            blocks=cfg["conv_s5"]["encoder"]["blocks"],
             dtype=jnp.float32
         )
 
         self.conv_s5 = conv_s5_layers.StackedLayers(
             ssm=self.ssm_init_fn,
-            n_layers=self.config["conv_s5"]["n_layers"],
-            training=True, # Always True to allow dropout if enabled
-            parallel=True, # Important: False for sequential inference/stepping
-            layer_activation=self.config["conv_s5"].get("activation", "gelu"),
-            use_norm=self.config["conv_s5"].get("use_norm", True),
-            prenorm=self.config["conv_s5"].get("prenorm", False)
+            n_layers=cfg["conv_s5"]["n_layers"],
+            training=True,
+            parallel=True,
+            layer_activation=cfg["conv_s5"].get("activation", "gelu"),
+            use_norm=cfg["conv_s5"].get("use_norm", True),
+            prenorm=cfg["conv_s5"].get("prenorm", False)
         )
-        
+
         self.spatial_softmax = SpatialSoftmax(
-            height=self.config["conv_s5"]["latent_h"], 
-            width=self.config["conv_s5"]["latent_w"]
+            height=cfg["conv_s5"]["latent_h"],
+            width=cfg["conv_s5"]["latent_w"]
         )
 
         self.actor_dense = fnn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
@@ -697,42 +699,48 @@ class ActorCriticConvS5(fnn.Module):
         self.critic_out = fnn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))
 
         self.priv_encoder = fnn.Dense(64, kernel_init=orthogonal(np.sqrt(2)))
-        
+
         self.log_std = self.param(
-            "log_std", 
-            constant(self.config['ppo']['log_std_init']), 
+            "log_std",
+            constant(cfg['ppo']['log_std_init']),
             (self.action_dim,)
         )
 
     def __call__(self, obs, dones, hidden):
-        # obs: {'image': [L, B, H, W, C], 'priv_state': [L, B, D]}
-        
-        img_input = obs['image']
-        L, B, H, W, C = img_input.shape
+        # obs: [L, B, D] flat -- split into image and priv_state inside XLA
+        L, B, D = obs.shape
+        stride = D // self.n_stack
+        obs_stacked = obs.reshape(L, B, self.n_stack, stride)
 
-        flat_img = img_input.reshape(L * B, H, W, C)
+        img_flat = obs_stacked[..., self.act_dim : self.act_dim + self.img_dim]
+        priv = obs_stacked[..., self.act_dim + self.img_dim : self.act_dim + self.img_dim + self.priv_dim]
+
+        # Use last stack frame
+        img_input = img_flat[:, :, -1, :].reshape(L, B, self.img_h, self.img_w, 1)
+        priv_input = priv[:, :, -1, :]
+
+        flat_img = img_input.reshape(L * B, self.img_h, self.img_w, 1)
         flat_img_embed = self.encoder(flat_img)
-        
+
         _, H_e, W_e, C_e = flat_img_embed.shape
         img_embed_seq = flat_img_embed.reshape(L, B, H_e, W_e, C_e)
         new_hidden, embedding = self.conv_s5(img_embed_seq, hidden, dones)
-        
-        # [L, B, H, W, C] -> [L*B, H, W, C]
+
         flat_embedding = embedding.reshape(L * B, H_e, W_e, C_e)
         flat_visual_feat = self.spatial_softmax(flat_embedding)
-        
+
         visual_feat = flat_visual_feat.reshape(L, B, -1)
-        
+
         # --- ACTOR PATH ---
         actor_h = fnn.relu(self.actor_dense(visual_feat))
         actor_mean = fnn.tanh(self.actor_out(actor_h))
-        
+
         pi = distrax.MultivariateNormalDiag(loc=actor_mean, scale_diag=jnp.exp(self.log_std))
 
         # --- CRITIC PATH ---
-        priv_feat = fnn.relu(self.priv_encoder(obs['priv_state']))
+        priv_feat = fnn.relu(self.priv_encoder(priv_input))
         critic_feat = jnp.concatenate([visual_feat, priv_feat], axis=-1)
-        
+
         critic_h = fnn.relu(self.critic_dense(critic_feat))
         critic_val = self.critic_out(critic_h)
         critic_val = jnp.squeeze(critic_val, axis=-1)
