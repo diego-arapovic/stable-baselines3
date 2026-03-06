@@ -437,12 +437,14 @@ class PPOJaxPolicy():
         init_obs = jnp.zeros((1, self.env_cfg["main"]["num_envs"], self.observation_space)) # adapt if necessary, to (self.env_cfg["main"]["num_envs"], self.observation_space)
         init_dones = jnp.zeros((1, self.env_cfg["main"]["num_envs"]))
         init_hstate = s5.StackedEncoderModel.initialize_carry(self.env_cfg["main"]["num_envs"], ssm_size, n_layers)
-        self.schedule = optax.linear_schedule(init_value=self.env_cfg["ppo"]["learning_rate"]["start"],
-                                                end_value=self.env_cfg["ppo"]["learning_rate"]["end"],
-                                                transition_steps=40000 #TODO adapt if necessary, e.g. 16000
-                                                )
-        self.tx = optax.chain(optax.clip_by_global_norm(0.5), optax.adam(self.schedule, eps=1e-5))
-        
+        max_grad_norm = self.env_cfg["ppo"]["max_grad_norm"]
+        lr_start = self.env_cfg["ppo"]["learning_rate"]["start"]
+        self.schedule = optax.constant_schedule(lr_start)
+        self.tx = optax.chain(
+            optax.clip_by_global_norm(max_grad_norm),
+            optax.adam(self.schedule, eps=1e-5),
+        )
+
         def apply_fn(params, *args, **kwargs):
             return self.s5net.apply({'params': params}, *args, **kwargs)
 
@@ -450,7 +452,7 @@ class PPOJaxPolicy():
             apply_fn=apply_fn,
             params=self.s5net.init(self.key, init_obs, init_dones, init_hstate)['params'],
             tx=self.tx,
-            )
+        )
 
         self.reset_noise()
 
@@ -467,18 +469,38 @@ class PPOJaxPolicy():
         batch_size = self.env_cfg["ppo"]["batch_size"]
         n_steps = self.env_cfg["ppo"]["n_steps"]
         num_envs = self.env_cfg["main"]["num_envs"]
+        max_grad_norm = self.env_cfg["ppo"]["max_grad_norm"]
+        lr_cfg = self.env_cfg["ppo"]["learning_rate"]
 
         buffer_size = n_steps * num_envs
         num_rollouts = total_timesteps // buffer_size
-        num_minibatches = (num_envs + batch_size - 1) // batch_size
+        num_minibatches = max(1, (buffer_size + batch_size - 1) // batch_size)
         transition_steps = num_rollouts * n_epochs * num_minibatches
 
-        self.schedule = optax.linear_schedule(init_value=self.env_cfg["ppo"]["learning_rate"]["start"],
-                                                end_value=self.env_cfg["ppo"]["learning_rate"]["end"],
-                                                transition_steps=transition_steps
-                                                )
-        self.tx = optax.chain(optax.clip_by_global_norm(0.5), optax.adam(self.schedule, eps=1e-5))
-        self.train_state = self.train_state.replace(tx=self.tx)
+        end_fraction = lr_cfg.get("end_fraction", 1.0)
+        if end_fraction < 1.0:
+            decay_steps = int(transition_steps * end_fraction)
+            self.schedule = optax.join_schedules(
+                [optax.linear_schedule(lr_cfg["start"], lr_cfg["end"], decay_steps),
+                 optax.constant_schedule(lr_cfg["end"])],
+                boundaries=[decay_steps],
+            )
+        else:
+            self.schedule = optax.linear_schedule(
+                init_value=lr_cfg["start"],
+                end_value=lr_cfg["end"],
+                transition_steps=transition_steps,
+            )
+
+        self.tx = optax.chain(
+            optax.clip_by_global_norm(max_grad_norm),
+            optax.adam(self.schedule, eps=1e-5),
+        )
+        self.train_state = TrainState.create(
+            apply_fn=self.train_state.apply_fn,
+            params=self.train_state.params,
+            tx=self.tx,
+        )
 
     def forward(self, obs: np.ndarray, deterministic: bool = False) -> np.ndarray:
         return self._predict(obs, deterministic=deterministic)
@@ -625,13 +647,14 @@ class PPOJaxConvPolicy(PPOJaxPolicy):
         
         init_hstate = conv_s5_layers.StackedLayers.initialize_carry(self.env_cfg)
 
-        self.schedule = optax.linear_schedule(
-            init_value=self.env_cfg["ppo"]["learning_rate"]["start"],
-            end_value=self.env_cfg["ppo"]["learning_rate"]["end"],
-            transition_steps=40000
+        max_grad_norm = self.env_cfg["ppo"]["max_grad_norm"]
+        lr_start = self.env_cfg["ppo"]["learning_rate"]["start"]
+        self.schedule = optax.constant_schedule(lr_start)
+        self.tx = optax.chain(
+            optax.clip_by_global_norm(max_grad_norm),
+            optax.adam(self.schedule, eps=1e-5),
         )
-        self.tx = optax.chain(optax.clip_by_global_norm(0.5), optax.adam(self.schedule, eps=1e-5))
-        
+
         def apply_fn(params, *args, **kwargs):
             return self.s5net.apply({'params': params}, *args, **kwargs)
 
