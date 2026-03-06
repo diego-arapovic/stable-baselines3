@@ -222,7 +222,8 @@ class ConvS5SSM(nn.Module):
                                             k_size=self.k_D,
                                             out_channels=self.U,
                                             num_groups=self.num_groups,
-                                            squeeze_excite=self.squeeze_excite)
+                                            squeeze_excite=self.squeeze_excite,
+                                            dtype=np.bfloat16)
         elif self.C_D_config == "diag_resnet":
             self.C_D_conv = VmapDiagResnetBlock(activation=self.activation,
                                                 k_size=self.k_D,
