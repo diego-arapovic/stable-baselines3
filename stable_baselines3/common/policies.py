@@ -664,6 +664,19 @@ class PPOJaxConvPolicy(PPOJaxPolicy):
             tx=self.tx,
         )
 
+        s5net_ref = self.s5net
+
+        def encode_fn(params, obs):
+            return s5net_ref.apply({'params': params}, obs, method=s5net_ref.encode)
+        self.encode_fn = jax.jit(encode_fn)
+
+        def train_apply_fn(params, encoded_obs, dones, hidden):
+            return s5net_ref.apply(
+                {'params': params}, encoded_obs, dones, hidden,
+                method=s5net_ref.forward_from_embeddings,
+            )
+        self.train_apply_fn = train_apply_fn
+
         self.reset_noise()
 
         return self.noise_key
@@ -729,8 +742,8 @@ class ActorCriticConvS5(fnn.Module):
             (self.action_dim,)
         )
 
-    def __call__(self, obs, dones, hidden):
-        # obs: [L, B, D] flat -- split into image and priv_state inside XLA
+    def _extract_and_encode(self, obs):
+        """Extract image/priv from raw obs and encode images through ResNet."""
         L, B, D = obs.shape
         stride = D // self.n_stack
         obs_stacked = obs.reshape(L, B, self.n_stack, stride)
@@ -743,32 +756,44 @@ class ActorCriticConvS5(fnn.Module):
         priv_input = priv[:, :, -1, :]
 
         flat_img = img_input.reshape(L * B, self.img_h, self.img_w, 1)
-        flat_img_embed = self.encoder(flat_img)
+        flat_img_embed = jnp.asarray(self.encoder(flat_img), jnp.float32)
 
         _, H_e, W_e, C_e = flat_img_embed.shape
         img_embed_seq = flat_img_embed.reshape(L, B, H_e, W_e, C_e)
+        return img_embed_seq, priv_input
+
+    def encode(self, obs):
+        """Encode raw observations (used for pre-encoding before training)."""
+        return self._extract_and_encode(obs)
+
+    def forward_from_embeddings(self, encoded_obs, dones, hidden):
+        """Forward pass from pre-encoded (img_embed_seq, priv_input) tuple."""
+        img_embed_seq, priv_input = encoded_obs
+
         new_hidden, embedding = self.conv_s5(img_embed_seq, hidden, dones)
 
+        L, B, H_e, W_e, C_e = embedding.shape
         flat_embedding = embedding.reshape(L * B, H_e, W_e, C_e)
         flat_visual_feat = self.spatial_softmax(flat_embedding)
-
         visual_feat = flat_visual_feat.reshape(L, B, -1)
 
         # --- ACTOR PATH ---
         actor_h = fnn.relu(self.actor_dense(visual_feat))
         actor_mean = fnn.tanh(self.actor_out(actor_h))
-
         pi = distrax.MultivariateNormalDiag(loc=actor_mean, scale_diag=jnp.exp(self.log_std))
 
         # --- CRITIC PATH ---
         priv_feat = fnn.relu(self.priv_encoder(priv_input))
         critic_feat = jnp.concatenate([visual_feat, priv_feat], axis=-1)
-
         critic_h = fnn.relu(self.critic_dense(critic_feat))
         critic_val = self.critic_out(critic_h)
         critic_val = jnp.squeeze(critic_val, axis=-1)
 
         return new_hidden, pi, critic_val
+
+    def __call__(self, obs, dones, hidden):
+        img_embed_seq, priv_input = self._extract_and_encode(obs)
+        return self.forward_from_embeddings((img_embed_seq, priv_input), dones, hidden)
 
 
 class ActorCriticPolicy(BasePolicy):
