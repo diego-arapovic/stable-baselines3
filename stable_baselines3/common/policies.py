@@ -391,8 +391,8 @@ class PPOJaxPolicy():
     ):
 
         super().__init__()
-        self.observation_space = observation_space._shape[0]
-        self.action_space = action_space._shape[0]
+        self.observation_space = observation_space
+        self.action_space = action_space
         self.log_std_init = env_cfg["ppo"]["log_std_init"]
         self.activation_fn = activation_fn
         self.n_units = 256
@@ -434,7 +434,7 @@ class PPOJaxPolicy():
                 )
         
         key, self.key = jax.random.split(key)
-        init_obs = jnp.zeros((1, self.env_cfg["main"]["num_envs"], self.observation_space)) # adapt if necessary, to (self.env_cfg["main"]["num_envs"], self.observation_space)
+        init_obs = jnp.zeros((1, self.env_cfg["main"]["num_envs"], self.observation_space.shape[0]))
         init_dones = jnp.zeros((1, self.env_cfg["main"]["num_envs"]))
         init_hstate = s5.StackedEncoderModel.initialize_carry(self.env_cfg["main"]["num_envs"], ssm_size, n_layers)
         max_grad_norm = self.env_cfg["ppo"]["max_grad_norm"]
