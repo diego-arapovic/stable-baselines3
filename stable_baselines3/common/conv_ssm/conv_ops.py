@@ -54,32 +54,34 @@ class ResnetBlock(nn.Module):
     out_channels: Optional[int] = None
     num_groups: int = 32
     squeeze_excite: bool = False
+    dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, x):
         # x is shape (BHWC)
         out_channels = self.out_channels or x.shape[-1]
+        x_in = jnp.asarray(x, self.dtype)
 
-        h = x
-        h = nn.GroupNorm(num_groups=self.num_groups)(h)
+        h = x_in
+        h = nn.GroupNorm(num_groups=self.num_groups, dtype=self.dtype)(h)
         h = self.activation(h)
         h = nn.Conv(out_channels, [self.k_size, self.k_size],
-                    padding='SAME')(h)
+                    padding='SAME', dtype=self.dtype)(h)
 
-        h = nn.GroupNorm(num_groups=self.num_groups)(h)
+        h = nn.GroupNorm(num_groups=self.num_groups, dtype=self.dtype)(h)
         h = self.activation(h)
         h = nn.Conv(out_channels, [self.k_size, self.k_size],
-                    padding='SAME')(h)
+                    padding='SAME', dtype=self.dtype)(h)
         if self.squeeze_excite:
-            h = SEBlock()(h)
+            h = SEBlock(dtype=self.dtype)(h)
 
-        if x.shape[-1] != out_channels:
+        if x_in.shape[-1] != out_channels:
             if self.use_conv_shortcut:
-                x = nn.Conv(out_channels, [self.k_size, self.k_size],
-                            padding='SAME')(x)
+                x_in = nn.Conv(out_channels, [self.k_size, self.k_size],
+                            padding='SAME', dtype=self.dtype)(x_in)
             else:
-                x = nn.Conv(out_channels, [1, 1])(x)
-        return self.activation(x + h)
+                x_in = nn.Conv(out_channels, [1, 1], dtype=self.dtype)(x_in)
+        return jnp.asarray(self.activation(x_in + h), jnp.float32)
 
 
 # For vmapping ResnetBlock across sequence length

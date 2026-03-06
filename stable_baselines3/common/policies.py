@@ -710,7 +710,7 @@ class ActorCriticConvS5(fnn.Module):
         self.encoder = ResNetEncoder(
             depths=cfg["conv_s5"]["encoder"]["depths"],
             blocks=cfg["conv_s5"]["encoder"]["blocks"],
-            dtype=jnp.float32
+            dtype=jnp.bfloat16
         )
 
         self.conv_s5 = conv_s5_layers.StackedLayers(
