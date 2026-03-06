@@ -445,27 +445,21 @@ class RolloutBuffer(BaseBuffer):
         episode_start: np.ndarray,
         value: np.ndarray,
         log_prob: np.ndarray,
-        # hidden_state: np.ndarray,  # Pre-processed to (Batch, H, Layers)
-        dones: np.ndarray,
+        dones: np.ndarray = None,
     ) -> None:
         """
         Optimized version: No copies, no reshapes, no checks.
         Trusts the loop to provide correct data.
         """
-        # DIRECT ASSIGNMENT (Numpy handles the copy into the buffer slice)
         self.observations[self.pos] = obs
         self.actions[self.pos] = action
         self.rewards[self.pos] = reward
         self.episode_starts[self.pos] = episode_start
-        
-        # Flattening should be done before passing in, but ravel() is cheap if needed
-        self.values[self.pos] = value.ravel() 
+        self.values[self.pos] = value.ravel()
         self.log_probs[self.pos] = log_prob.ravel()
-        
-        # Hidden state is now a single array, assigned directly
-        # if hidden_state is not None:
-        #     self.hidden_states[self.pos] = hidden_state
-        #     self.dones[self.pos] = dones
+
+        if dones is not None and hasattr(self, 'dones'):
+            self.dones[self.pos] = dones
 
         self.pos += 1
         if self.pos == self.buffer_size:
@@ -519,58 +513,73 @@ class RolloutBuffer(BaseBuffer):
 
     def get(self, batch_size: Optional[int] = None) -> Generator[RolloutBufferSamples, None, None]:
         assert self.full, ""
-        indices = np.random.permutation(self.buffer_size * self.n_envs)
-        # Prepare the data
-        if not self.generator_ready:
 
-            _tensor_names = [
-                "observations",
-                # "hidden_states",
-                "dones",
-                "actions",
-                "values",
-                "log_probs",
-                "advantages",
-                "returns",
-            ]
+        is_recurrent = (hasattr(self, "env_cfg") and self.env_cfg is not None
+                        and self.env_cfg["main"].get("policy") in ["S5", "CONVS5"])
 
-            for tensor in _tensor_names:
-                self.__dict__[tensor] = self.swap_and_flatten(self.__dict__[tensor])
-            self.generator_ready = True
+        if is_recurrent:
+            # Recurrent path: slice by env dimension, keep time axis intact.
+            # batch_size is in timesteps (SB3 convention); derive envs per batch.
+            env_indices = np.random.permutation(self.n_envs)
+            n_envs_per_batch = max(1, batch_size // self.buffer_size) if batch_size else self.n_envs
 
-        # Return everything, don't create minibatches
-        if batch_size is None:
-            batch_size = self.buffer_size * self.n_envs
+            start_idx = 0
+            while start_idx < self.n_envs:
+                batch_inds = env_indices[start_idx : start_idx + n_envs_per_batch]
+                yield self._get_samples(batch_inds)
+                start_idx += n_envs_per_batch
+        else:
+            # Standard path: swap-and-flatten, then slice by timestep indices.
+            indices = np.random.permutation(self.buffer_size * self.n_envs)
+            if not self.generator_ready:
+                _tensor_names = [
+                    "observations",
+                    "dones",
+                    "actions",
+                    "values",
+                    "log_probs",
+                    "advantages",
+                    "returns",
+                ]
+                for tensor in _tensor_names:
+                    self.__dict__[tensor] = self.swap_and_flatten(self.__dict__[tensor])
+                self.generator_ready = True
 
-        start_idx = 0
-        while start_idx < self.buffer_size * self.n_envs:
-            yield self._get_samples(indices[start_idx : start_idx + batch_size])
-            start_idx += batch_size
+            if batch_size is None:
+                batch_size = self.buffer_size * self.n_envs
+
+            start_idx = 0
+            while start_idx < self.buffer_size * self.n_envs:
+                yield self._get_samples(indices[start_idx : start_idx + batch_size])
+                start_idx += batch_size
 
     def _get_samples(self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None) -> RolloutBufferSamples:
-        if self.env_cfg["main"].get("policy", None) in ["S5", "CONVS5"]:
+        is_recurrent = (hasattr(self, "env_cfg") and self.env_cfg is not None
+                        and self.env_cfg["main"].get("policy") in ["S5", "CONVS5"])
+
+        if is_recurrent:
+            # batch_inds are ENV indices; slice along env dimension (axis 1)
             data = (
-                self.observations[:],
-                # self.hidden_states[:],
-                self.dones[:],
-                self.actions[:],
-                self.values[:],
-                self.log_probs[:],
-                self.advantages[:],
-                self.returns[:],
+                self.observations[:, batch_inds],
+                self.dones[:, batch_inds],
+                self.actions[:, batch_inds],
+                self.values[:, batch_inds],
+                self.log_probs[:, batch_inds],
+                self.advantages[:, batch_inds],
+                self.returns[:, batch_inds],
                 batch_inds,
             )
             return RolloutBufferSamples(*data)
         else:
             data = (
                 self.observations[batch_inds],
-                # self.hidden_states[:],
-                self.dones[:],
+                self.dones[:] if hasattr(self, 'dones') and self.dones is not None else np.zeros(1),
                 self.actions[batch_inds],
                 self.values[batch_inds].flatten(),
                 self.log_probs[batch_inds].flatten(),
                 self.advantages[batch_inds].flatten(),
                 self.returns[batch_inds].flatten(),
+                batch_inds,
             )
             return RolloutBufferSamples(*tuple(map(self.to_torch, data)))
 
@@ -861,22 +870,15 @@ class DictRolloutBuffer(RolloutBuffer):
         
         # --- PATH A: Recurrent/ConvS5 (Sequence Preserving) ---
         if self.is_recurrent:
-            # Logic: We slice the Batch Dimension (Envs), but keep Time Dimension (Buffer Size) intact.
-            # batch_size here represents "Number of Environments per MiniBatch"
-            
-            env_indices = np.arange(self.n_envs)
-            np.random.shuffle(env_indices) # Shuffle environments for stochasticity
-            
-            # Default to processing all envs at once if no batch_size (Dangerous for Memory!)
-            n_envs_per_batch = batch_size if batch_size is not None else self.n_envs
-            
+            # Slice the env dimension, keep time dimension intact.
+            # batch_size is in timesteps (SB3 convention); derive envs per batch.
+            env_indices = np.random.permutation(self.n_envs)
+            n_envs_per_batch = max(1, batch_size // self.buffer_size) if batch_size is not None else self.n_envs
+
             start_idx = 0
             while start_idx < self.n_envs:
-                # Select a subset of environments
                 batch_inds = env_indices[start_idx : start_idx + n_envs_per_batch]
-                
                 yield self._get_samples(batch_inds, recurrent=True)
-                
                 start_idx += n_envs_per_batch
 
         # --- PATH B: Standard PPO (Flattened) ---
