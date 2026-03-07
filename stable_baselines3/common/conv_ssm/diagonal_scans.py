@@ -81,7 +81,9 @@ def apply_convSSM_parallel(A, B, C, us, x0, d):
     L = us.shape[0]
     bsz = us.shape[1]
     
-    Bus = vmap_conv(B, np.complex64(us))
+    # Real-valued decomposition: conv(us, B) = conv(us, B.real) + 1j*conv(us, B.imag)
+    # Avoids complex64 cast of us (halves memory) and uses 2 real convs instead of 4
+    Bus = vmap_conv(B.real, us) + 1j * vmap_conv(B.imag, us)
     x0_expanded = np.expand_dims(A, (0, 1, 2)) * x0
 
     if d is None:
@@ -101,7 +103,8 @@ def apply_convSSM_parallel(A, B, C, us, x0, d):
         
         _, xs, _ = lax.associative_scan(conv_binary_operator_reset, (As, Bus, d))
 
-    ys = 2 * vmap_conv(C, xs).real
+    # Real-valued decomposition: conv(C, xs).real = conv(C.real, xs.real) - conv(C.imag, xs.imag)
+    ys = 2 * (vmap_conv(C.real, xs.real) - vmap_conv(C.imag, xs.imag))
 
     return xs[-1], ys
 
@@ -126,14 +129,18 @@ def apply_convSSM_sequential(A, B, C, us, x0, d):
             x_k_1 = x_k_1 * (1 - c_k)
         else:
             u_k = inputs
-            
-        Bu = lax.conv_general_dilated(np.complex64(u_k), B, (1, 1),
-                                      'SAME',
-                                      dimension_numbers=('NHWC', 'HWIO', 'NHWC'))
+
+        # Real-valued decomposition for B: conv(u, B) = conv(u, B.real) + 1j*conv(u, B.imag)
+        Bu = (lax.conv_general_dilated(u_k, B.real, (1, 1), 'SAME',
+               dimension_numbers=('NHWC', 'HWIO', 'NHWC'))
+              + 1j * lax.conv_general_dilated(u_k, B.imag, (1, 1), 'SAME',
+                 dimension_numbers=('NHWC', 'HWIO', 'NHWC')))
         x_k = np.expand_dims(A, (0, 1, 2)) * x_k_1 + Bu
-        y_k = 2 * lax.conv_general_dilated(x_k, C, (1, 1),
-                                           'SAME',
-                                           dimension_numbers=('NHWC', 'HWIO', 'NHWC')).real
+        # Real-valued decomposition for C: conv(C, x).real = conv(C.real, x.real) - conv(C.imag, x.imag)
+        y_k = 2 * (lax.conv_general_dilated(x_k.real, C.real, (1, 1), 'SAME',
+                 dimension_numbers=('NHWC', 'HWIO', 'NHWC'))
+                 - lax.conv_general_dilated(x_k.imag, C.imag, (1, 1), 'SAME',
+                   dimension_numbers=('NHWC', 'HWIO', 'NHWC')))
         return x_k, y_k
     scan_inputs = (us, d) if d is not None else us
     return lax.scan(step, np.complex64(x0), scan_inputs)
