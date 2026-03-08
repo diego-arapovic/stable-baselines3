@@ -693,6 +693,17 @@ class PPOJaxConvPolicy(PPOJaxPolicy):
         return hidden_stack, hidden_state, jnp.squeeze(actions, axis=0), jnp.squeeze(clipped_actions, axis=0), jnp.squeeze(log_probs, axis=0), jnp.squeeze(values, axis=0)
 
 
+def _learned_pool(x: jnp.ndarray, pool_conv: fnn.Module) -> jnp.ndarray:
+    """Attention-based pooling: 1x1 conv logits -> softmax over space -> weighted sum. x: (B, H, W, C)."""
+    B, H, W, C = x.shape
+    logits = pool_conv(x)  # (B, H, W, 1)
+    logits = logits.reshape(B, -1)
+    weights = fnn.softmax(logits, axis=-1)  # (B, H*W)
+    weights = weights.reshape(B, -1, 1)
+    x_flat = x.reshape(B, -1, C)
+    return jnp.sum(weights * x_flat, axis=1)  # (B, C)
+
+
 class ActorCriticConvS5(fnn.Module):
     action_dim: int
     config: Dict
@@ -723,11 +734,55 @@ class ActorCriticConvS5(fnn.Module):
             prenorm=cfg["conv_s5"].get("prenorm", False)
         )
 
-        summary_dim = cfg["conv_s5"].get("summary_dim", 256)
-        self.summary_dim = summary_dim
-        self.summary_head = fnn.Dense(
-            summary_dim,
+        # Feed other_obs into recurrence: project to d_model and add to image embedding (minimal params)
+        d_model = cfg["conv_s5"]["d_model"]
+        self.other_obs_proj = fnn.Dense(
+            d_model,
+            kernel_init=orthogonal(1.0),
+            bias_init=constant(0.0),
+        )
+
+        # Richer visual path: small CNN summary (spatially aware) + spatial softmax + avg pool
+        latent_h = cfg["conv_s5"].get("latent_h", 11)
+        latent_w = cfg["conv_s5"].get("latent_w", 11)
+        self.spatial_softmax = SpatialSoftmax(height=latent_h, width=latent_w)
+
+        cnn_summary_dim = cfg["conv_s5"].get("summary_dim", 256)
+        cnn_summary_channels = cfg["conv_s5"].get("summary_cnn_channels", (64, 128))
+        self.conv_summary_1 = fnn.Conv(
+            cnn_summary_channels[0],
+            kernel_size=(3, 3),
+            padding="SAME",
             kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )
+        self.conv_summary_2 = fnn.Conv(
+            cnn_summary_channels[1],
+            kernel_size=(3, 3),
+            padding="SAME",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )
+        # Learned pooling: 1x1 conv -> softmax over space -> weighted sum (instead of avg pool)
+        self.cnn_pool_conv = fnn.Conv(
+            1,
+            kernel_size=(1, 1),
+            padding="SAME",
+            kernel_init=orthogonal(1.0),
+            bias_init=constant(0.0),
+        )
+        self.cnn_summary_dense = fnn.Dense(
+            cnn_summary_dim,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )
+
+        # Learned pooling for spatial branch (replaces avg pool over Conv-S5 embedding)
+        self.spatial_pool_conv = fnn.Conv(
+            1,
+            kernel_size=(1, 1),
+            padding="SAME",
+            kernel_init=orthogonal(1.0),
             bias_init=constant(0.0),
         )
 
@@ -775,24 +830,37 @@ class ActorCriticConvS5(fnn.Module):
         """Forward pass from pre-encoded (img_embed_seq, priv_input, other_input) tuple."""
         img_embed_seq, priv_input, other_input = encoded_obs
 
-        new_hidden, embedding = self.conv_s5(img_embed_seq, hidden, dones)
+        # Feed other_obs into recurrence: project and add to image embedding (broadcast over H,W)
+        other_proj = self.other_obs_proj(other_input)  # (L, B, d_model)
+        other_broadcast = jnp.expand_dims(other_proj, axis=(2, 3))  # (L, B, 1, 1, d_model)
+        ssm_input = img_embed_seq + other_broadcast
+        new_hidden, embedding = self.conv_s5(ssm_input, hidden, dones)
 
         L, B, H_e, W_e, C_e = embedding.shape
         flat_embedding = embedding.reshape(L * B, H_e, W_e, C_e)
 
-        flat_vec = flat_embedding.reshape(L * B, -1)
-        summary_feat = fnn.relu(self.summary_head(flat_vec))
-        summary_feat = summary_feat.reshape(L, B, -1)
+        # Branch 1: Small CNN summary + learned pooling (attention over space)
+        cnn_h = fnn.relu(self.conv_summary_1(flat_embedding))
+        cnn_h = fnn.relu(self.conv_summary_2(cnn_h))
+        cnn_pooled = _learned_pool(cnn_h, self.cnn_pool_conv)  # (L*B, cnn_summary_channels[1])
+        cnn_summary = fnn.relu(self.cnn_summary_dense(cnn_pooled))  # (L*B, summary_dim)
+        cnn_summary = cnn_summary.reshape(L, B, -1)
 
-        # --- ACTOR PATH ---
-        actor_feat = jnp.concatenate([summary_feat, other_input], axis=-1)
+        # Branch 2: Spatial softmax + learned pool ("where" + learned "what", compact)
+        spatial_softmax_out = self.spatial_softmax(flat_embedding)  # (L*B, C*2)
+        learned_pool_out = _learned_pool(flat_embedding, self.spatial_pool_conv)  # (L*B, C)
+        spatial_feat = jnp.concatenate([learned_pool_out, spatial_softmax_out], axis=-1)  # (L*B, 3*C)
+        spatial_feat = spatial_feat.reshape(L, B, -1)
+
+        # Maximum: concat [cnn_summary, spatial_feat, other_obs] for actor
+        actor_feat = jnp.concatenate([cnn_summary, spatial_feat, other_input], axis=-1)
         actor_h = fnn.relu(self.actor_dense(actor_feat))
         actor_mean = fnn.tanh(self.actor_out(actor_h))
         pi = distrax.MultivariateNormalDiag(loc=actor_mean, scale_diag=jnp.exp(self.log_std))
 
-        # --- CRITIC PATH ---
+        # Critic: same visual (cnn_summary + spatial_feat) + priv
         priv_feat = fnn.relu(self.priv_encoder(priv_input))
-        critic_feat = jnp.concatenate([summary_feat, priv_feat], axis=-1)
+        critic_feat = jnp.concatenate([cnn_summary, spatial_feat, priv_feat], axis=-1)
         critic_h = fnn.relu(self.critic_dense(critic_feat))
         critic_val = self.critic_out(critic_h)
         critic_val = jnp.squeeze(critic_val, axis=-1)
