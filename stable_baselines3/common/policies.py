@@ -723,9 +723,12 @@ class ActorCriticConvS5(fnn.Module):
             prenorm=cfg["conv_s5"].get("prenorm", False)
         )
 
-        self.spatial_softmax = SpatialSoftmax(
-            height=cfg["conv_s5"]["latent_h"],
-            width=cfg["conv_s5"]["latent_w"]
+        summary_dim = cfg["conv_s5"].get("summary_dim", 256)
+        self.summary_dim = summary_dim
+        self.summary_head = fnn.Dense(
+            summary_dim,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
         )
 
         self.actor_dense = fnn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
@@ -777,20 +780,19 @@ class ActorCriticConvS5(fnn.Module):
         L, B, H_e, W_e, C_e = embedding.shape
         flat_embedding = embedding.reshape(L * B, H_e, W_e, C_e)
 
-        spatial_softmax_out = self.spatial_softmax(flat_embedding)  # (B, C*2)
-        avg_pool_out = jnp.mean(flat_embedding, axis=(1, 2))  # (B, C)
-        visual_feat = jnp.concatenate([avg_pool_out, spatial_softmax_out], axis=-1)  # (B, 3*C)
-        visual_feat = visual_feat.reshape(L, B, -1)
+        flat_vec = flat_embedding.reshape(L * B, -1)
+        summary_feat = fnn.relu(self.summary_head(flat_vec))
+        summary_feat = summary_feat.reshape(L, B, -1)
 
-        # --- ACTOR PATH: augmented visual + other_obs (NOT priv_obs) ---
-        actor_feat = jnp.concatenate([visual_feat, other_input], axis=-1)
+        # --- ACTOR PATH ---
+        actor_feat = jnp.concatenate([summary_feat, other_input], axis=-1)
         actor_h = fnn.relu(self.actor_dense(actor_feat))
         actor_mean = fnn.tanh(self.actor_out(actor_h))
         pi = distrax.MultivariateNormalDiag(loc=actor_mean, scale_diag=jnp.exp(self.log_std))
 
-        # --- CRITIC PATH: augmented visual + priv_feat (unchanged) ---
+        # --- CRITIC PATH ---
         priv_feat = fnn.relu(self.priv_encoder(priv_input))
-        critic_feat = jnp.concatenate([visual_feat, priv_feat], axis=-1)
+        critic_feat = jnp.concatenate([summary_feat, priv_feat], axis=-1)
         critic_h = fnn.relu(self.critic_dense(critic_feat))
         critic_val = self.critic_out(critic_h)
         critic_val = jnp.squeeze(critic_val, axis=-1)
