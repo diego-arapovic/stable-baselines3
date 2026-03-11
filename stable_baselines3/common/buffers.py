@@ -534,7 +534,7 @@ class RolloutBuffer(BaseBuffer):
             if not self.generator_ready:
                 _tensor_names = [
                     "observations",
-                    "dones",
+                    # "dones",
                     "actions",
                     "values",
                     "log_probs",
